@@ -58,6 +58,23 @@ namespace {
     }
   };
 
+  template <typename T>
+  class Span {
+  private:
+    T *mBegin;
+    T *mEnd;
+  public:
+    template <typename Size>
+    Span(T *begin, Size count)
+      : mBegin{begin}
+      , mEnd{begin + count}
+    {}
+    T *begin() { return mBegin; }
+    T *end() { return mEnd; }
+    T const *begin() const { return mBegin; }
+    T const *end() const { return mEnd; }
+  };
+
   class DirectRenderingManager {
   private:
     FileDescriptor mDescriptor;
@@ -129,15 +146,10 @@ namespace {
         return result;
       }
 
-      class Encoders {
-      private:
-        drmModeConnector const &mHandle;
-      public:
-        Encoders(drmModeConnector const &handle) : mHandle{handle} {}
-        auto begin() const { return mHandle.encoders; }
-        auto end() const { return mHandle.encoders + mHandle.count_encoders; }
-      };
-      Encoders encoders() const { return {*mHandle.get()}; }
+      Span<uint32_t> const encoders() const {
+        assert(*this);
+        return {mHandle->encoders, mHandle->count_encoders};
+      }
     };
 
     class Resources {
@@ -151,26 +163,15 @@ namespace {
 
       explicit operator bool() const { return mHandle != nullptr; }
 
-      class Connectors {
-      private:
-        drmModeRes const &mHandle;
-      public:
-        Connectors(drmModeRes const &handle) : mHandle{handle} {}
-        auto begin() const { return mHandle.connectors; }
-        auto end() const {
-          return mHandle.connectors + mHandle.count_connectors;
-        }
-      };
-      Connectors connectors() const { return {*mHandle.get()}; }
+      Span<uint32_t> const connectors() const {
+        assert(*this);
+        return {mHandle->connectors, mHandle->count_connectors};
+      }
 
-      class Crtcs {
-        drmModeRes const &mHandle;
-      public:
-        Crtcs(drmModeRes const &handle) : mHandle{handle} {}
-        auto begin() const { return mHandle.crtcs; }
-        auto end() const { return mHandle.crtcs + mHandle.count_crtcs; }
-      };
-      Crtcs crtcs() const { return {*mHandle.get()}; }
+      Span<uint32_t> const crtcs() const {
+        assert(*this);
+        return {mHandle->crtcs, mHandle->count_crtcs};
+      }
     };
 
     std::optional<uint32_t> find_crtc_for_connector(
