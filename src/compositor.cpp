@@ -58,92 +58,148 @@ namespace {
 
   class DirectRenderingManager {
   private:
-    using Resources = std::unique_ptr<
-      drmModeRes, decltype(&drmModeFreeResources)
-    >;
-
-    using Connector = std::unique_ptr<
-      drmModeConnector, decltype(&drmModeFreeConnector)
-    >;
-
-    using Encoder = std::unique_ptr<
-      drmModeEncoder, decltype(&drmModeFreeEncoder)
-    >;
-
     FileDescriptor mDescriptor;
     drmModeModeInfo &mModeInfo;
     uint32_t mCRTControllerID;
     uint32_t mConnectorID;
 
-    static auto
-    drmResources(int file_descriptor) {
-      auto result = Resources {
-        drmModeGetResources(file_descriptor), &drmModeFreeResources
-      };
-      if (!result) perror("Couldn't retrieve DRM resources");
-      return result;
-    }
+    class Encoder {
+    private:
+      std::unique_ptr<drmModeEncoder, decltype(&drmModeFreeEncoder)> mHandle;
+    public:
+      Encoder() : mHandle{nullptr, &drmModeFreeEncoder} {}
+      Encoder(int file_descriptor, uint32_t encoder_id)
+        : mHandle{
+            drmModeGetEncoder(file_descriptor, encoder_id)
+          , &drmModeFreeEncoder
+          }
+      { if (!mHandle) perror("Couldn't get encoder"); }
 
-    static auto
-    drmConnector(int file_descriptor, uint32_t connector_id) {
-      auto result = Connector {
-        drmModeGetConnector(file_descriptor, connector_id)
-      , &drmModeFreeConnector
-      };
-      if (!result) perror("Couldn't get connector");
-      return result;
-    }
+      explicit operator bool() const { return mHandle != nullptr; }
 
-    static auto
-    drmEncoder(int file_descriptor, uint32_t encoder_id) {
-      auto result = Encoder {
-        drmModeGetEncoder(file_descriptor, encoder_id)
-      , &drmModeFreeEncoder
-      };
-      if (!result) perror("Couldn't get encoder");
-      return result;
-    }
+      uint32_t id() const { return mHandle->encoder_id; }
 
-    static Connector findConnector(int file_descriptor, drmModeRes *resources) {
+      uint32_t crtc_id() const { return mHandle->crtc_id; }
+
+      bool has_crtc(int index) const {
+        return mHandle->possible_crtcs & (1 << index);
+      }
+    };
+
+    class Connector {
+    private:
+      std::unique_ptr<drmModeConnector, decltype(&drmModeFreeConnector)>
+        mHandle
+      ;
+    public:
+      Connector() : mHandle{nullptr, &drmModeFreeConnector} {}
+      Connector(int file_descriptor, uint32_t connector_id)
+        : mHandle{
+            drmModeGetConnector(file_descriptor, connector_id)
+          , &drmModeFreeConnector
+          }
+      { if (!mHandle) perror("Couldn't get connector"); }
+
+      explicit operator bool() const { return mHandle != nullptr; }
+
+      bool is_connected() const {
+        return mHandle->connection == DRM_MODE_CONNECTED;
+      }
+
+      uint32_t id() const { return mHandle->connector_id; }
+
+      uint32_t encoder_id() const {
+        return mHandle->encoder_id;
+      }
+
+      drmModeModeInfo *find_best_mode() const {
+        assert(*this);
+        drmModeModeInfo *result = nullptr;
+        for (int i = 0, biggest_area = 0; i < mHandle->count_modes; i++) {
+          drmModeModeInfo &mode = mHandle->modes[i];
+          if (mode.type & DRM_MODE_TYPE_PREFERRED) return &mode;
+          int area = mode.hdisplay * mode.vdisplay;
+          if (area > biggest_area) {
+            result = &mode;
+            biggest_area = area;
+          }
+        }
+        if (!result) std::cerr << "No mode found" << std::endl;
+        return result;
+      }
+
+      template <typename Callback>
+      void each_encoder(int file_descriptor, Callback &&callback) const {
+        assert(*this);
+        for (int i = 0; i < mHandle->count_encoders; i++) {
+          auto encoder = Encoder{file_descriptor, mHandle->encoders[i]};
+          if (encoder) if (callback(std::move(encoder))) return;
+        }
+      }
+    };
+
+    class Resources {
+    private:
+      std::unique_ptr<drmModeRes, decltype(&drmModeFreeResources)> mHandle;
+    public:
+      Resources(int file_descriptor)
+        : mHandle{drmModeGetResources(file_descriptor), &drmModeFreeResources}
+      { if (!mHandle) perror("Couldn't retrieve DRM resources"); }
+
+      explicit operator bool() const { return mHandle != nullptr; }
+
+      template <typename Callback>
+      void each_connector(int file_descriptor, Callback &&callback) const {
+        assert(*this);
+        for (int i = 0; i < mHandle->count_connectors; i++) {
+          auto connector = Connector{file_descriptor, mHandle->connectors[i]};
+          if (connector) if (callback(std::move(connector))) return;
+        }
+      }
+
+      template <typename Callback>
+      void each_encoder(int file_descriptor, Callback &&callback) const {
+        assert(*this);
+        for (int i = 0; i < mHandle->count_encoders; i++) {
+          auto encoder = Encoder{file_descriptor, mHandle->encoders[i]};
+          if (encoder) if (callback(std::move(encoder))) return;
+        }
+      }
+    };
+
+    static Connector find_connector(int file_descriptor, Resources &resources) {
       // Just choose the first connection for now
-      for (int i = 0; i < resources->count_connectors; i++) {
-        auto connector = drmConnector(
-          file_descriptor, resources->connectors[i]
-        );
-        if (connector->connection == DRM_MODE_CONNECTED) {
-          return connector;
+      Connector result{};
+      resources.each_connector(
+        file_descriptor
+      , [&](Connector connector) {
+          if (connector.is_connected()) {
+            result = std::move(connector);
+            return true;
+          } else return false;
         }
-      }
-      std::cerr << "No connected connector" << std::endl;
-      return Connector {nullptr, &drmModeFreeConnector};
-    }
-
-    static drmModeModeInfo *findMode(drmModeConnector *connector) {
-      drmModeModeInfo *result = nullptr;
-      for (int i = 0, biggest_area = 0; i < connector->count_modes; i++) {
-        drmModeModeInfo &mode = connector->modes[i];
-        if (mode.type & DRM_MODE_TYPE_PREFERRED) return &mode;
-        int area = mode.hdisplay * mode.vdisplay;
-        if (area > biggest_area) {
-          result = &mode;
-          biggest_area = area;
-        }
-      }
-      if (!result) std::cerr << "No mode found" << std::endl;
+      );
+      if (!result) std::cerr << "No connected connector" << std::endl;
       return result;
     }
 
-    static auto findEncoder(
-      int file_descriptor, drmModeRes *resources, drmModeConnector *connector
+    static auto find_encoder(
+      int file_descriptor
+    , Resources const &resources
+    , Connector const &connector
     ) {
-      for (int i = 0; i < resources->count_encoders; i++) {
-        auto encoder = drmEncoder(file_descriptor, resources->encoders[i]);
-        if (encoder->encoder_id == connector->encoder_id) {
-          return encoder;
+      Encoder result{};
+      resources.each_encoder(
+        file_descriptor
+      , [&](Encoder encoder) {
+          if (encoder.id() == connector.encoder_id()) {
+            result = std::move(encoder);
+            return true;
+          } else return false;
         }
-      }
-      std::cerr << "No encoder found" << std::endl;
-      return Encoder {nullptr, &drmModeFreeEncoder};
+      );
+      if (!result) std::cerr << "No encoder found" << std::endl;
+      return result;
     }
 
     DirectRenderingManager(
@@ -158,23 +214,21 @@ namespace {
       FileDescriptor descriptor{path};
       if (!descriptor) return std::nullopt;
 
-      auto resources = drmResources(descriptor.get());
+      Resources resources{descriptor.get()};
       if (!resources) return std::nullopt;
 
-      auto connector = findConnector(descriptor.get(), resources.get());
+      Connector connector = find_connector(descriptor.get(), resources);
       if (!connector) return std::nullopt;
 
-      auto mode = findMode(connector.get());
+      auto mode = connector.find_best_mode();
       if (!mode) return std::nullopt;
 
-      auto encoder = findEncoder(
-        descriptor.get(), resources.get(), connector.get()
-      );
+      auto encoder = find_encoder(descriptor.get(), resources, connector);
       // TODO - fancier stuff here
       if (!encoder) return std::nullopt;
 
       return DirectRenderingManager{
-        std::move(descriptor), *mode, encoder->crtc_id, connector->connector_id
+        std::move(descriptor), *mode, encoder.crtc_id(), connector.id()
       };
     }
   };
