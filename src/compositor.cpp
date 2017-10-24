@@ -1,6 +1,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 
 #include <cassert>
@@ -59,14 +60,9 @@ namespace {
 
   class DirectRenderingManager {
   private:
-    //struct Connection {
-    //  drmModeModeInfo &mModeInfo;
-    //  uint32_t mCRTControllerID;
-    //  uint32_t mConnectorID;
-    //};
-
     FileDescriptor mDescriptor;
     std::unordered_map<uint32_t, uint32_t> mConnectorCrtcLookup;
+    std::set<uint32_t> mUnusedCrtcs;
 
     class Encoder {
     private:
@@ -133,19 +129,21 @@ namespace {
         return result;
       }
 
-      template <typename Callback>
-      void each_encoder(int file_descriptor, Callback &&callback) const {
-        assert(*this);
-        for (int i = 0; i < mHandle->count_encoders; i++) {
-          auto encoder = Encoder{file_descriptor, mHandle->encoders[i]};
-          if (encoder) if (callback(std::move(encoder))) return;
-        }
-      }
+      class Encoders {
+      private:
+        drmModeConnector const &mHandle;
+      public:
+        Encoders(drmModeConnector const &handle) : mHandle{handle} {}
+        auto begin() const { return mHandle.encoders; }
+        auto end() const { return mHandle.encoders + mHandle.count_encoders; }
+      };
+      Encoders encoders() const { return {*mHandle.get()}; }
     };
 
     class Resources {
     private:
       std::unique_ptr<drmModeRes, decltype(&drmModeFreeResources)> mHandle;
+
     public:
       Resources(int file_descriptor)
         : mHandle{drmModeGetResources(file_descriptor), &drmModeFreeResources}
@@ -153,49 +151,65 @@ namespace {
 
       explicit operator bool() const { return mHandle != nullptr; }
 
-      template <typename Callback>
-      void each_connector(int file_descriptor, Callback &&callback) const {
-        assert(*this);
-        for (int i = 0; i < mHandle->count_connectors; i++) {
-          auto connector = Connector{file_descriptor, mHandle->connectors[i]};
-          if (connector) if (callback(std::move(connector))) return;
+      class Connectors {
+      private:
+        drmModeRes const &mHandle;
+      public:
+        Connectors(drmModeRes const &handle) : mHandle{handle} {}
+        auto begin() const { return mHandle.connectors; }
+        auto end() const {
+          return mHandle.connectors + mHandle.count_connectors;
         }
-      }
+      };
+      Connectors connectors() const { return {*mHandle.get()}; }
 
-      template <typename Callback>
-      void each_encoder(int file_descriptor, Callback &&callback) const {
-        assert(*this);
-        for (int i = 0; i < mHandle->count_encoders; i++) {
-          auto encoder = Encoder{file_descriptor, mHandle->encoders[i]};
-          if (encoder) if (callback(std::move(encoder))) return;
-        }
-      }
+      class Crtcs {
+        drmModeRes const &mHandle;
+      public:
+        Crtcs(drmModeRes const &handle) : mHandle{handle} {}
+        auto begin() const { return mHandle.crtcs; }
+        auto end() const { return mHandle.crtcs + mHandle.count_crtcs; }
+      };
+      Crtcs crtcs() const { return {*mHandle.get()}; }
     };
 
-    static auto find_encoder(
-      int file_descriptor
-    , Resources const &resources
-    , Connector const &connector
+    std::optional<uint32_t> find_crtc_for_connector(
+      Resources const &resources, Connector const &connector
     ) {
-      Encoder result{};
-      resources.each_encoder(
-        file_descriptor
-      , [&](Encoder encoder) {
-          if (encoder.id() == connector.encoder_id()) {
-            result = std::move(encoder);
-            return true;
-          } else return false;
+      for (uint32_t encoder_id : connector.encoders()) {
+        Encoder encoder{mDescriptor.get(), encoder_id};
+        if (!encoder) continue;
+        int i = 0;
+        for (uint32_t crtc_id : resources.crtcs()) {
+          bool unused =
+            mUnusedCrtcs.find(crtc_id) == mUnusedCrtcs.end()
+          ;
+          if (encoder.has_crtc(i) && unused) return crtc_id;
+          ++i;
         }
-      );
-      if (!result) std::cerr << "No encoder found" << std::endl;
-      return result;
+      }
+      return std::nullopt;
+    }
+
+    void set_mode(uint32_t /*connection_id*/, uint32_t /*crtc_id*/) {
     }
 
   public:
     DirectRenderingManager(
       FileDescriptor descriptor
     ) : mDescriptor{std::move(descriptor)}, mConnectorCrtcLookup{}
-    {}
+      , mUnusedCrtcs{}
+    {
+      // Populate the unused crtc list
+      if (!mDescriptor) return;
+
+      Resources resources{mDescriptor.get()};
+      if (!resources) return;
+
+      for (uint32_t crtc_id : resources.crtcs()) {
+        mUnusedCrtcs.insert(crtc_id);
+      }
+    }
 
     explicit operator bool() const { return static_cast<bool>(mDescriptor); }
 
@@ -205,31 +219,30 @@ namespace {
       Resources resources{mDescriptor.get()};
       if (!resources) return;
 
-      std::unordered_map<uint32_t, uint32_t> new_lookup{};
-      resources.each_connector(
-        mDescriptor.get()
-      , [&](Connector connector) {
-          auto it = mConnectorCrtcLookup.find(connector.id());
-          if (it != mConnectorCrtcLookup.end()) {
-            auto node = mConnectorCrtcLookup.extract(it);
-            if (connector.is_connected()) {
-              new_lookup.insert(std::move(node));
-            }
-          } else if (connector.is_connected()) {
-            auto mode = connector.find_best_mode();
-            if (!mode) return false;
+      for (uint32_t connector_id : resources.connectors()) {
+        Connector connector{mDescriptor.get(), connector_id};
+        if (!connector) continue;
 
-            auto encoder = find_encoder(
-              mDescriptor.get(), resources, connector
-            );
-            // TODO - fancier stuff here
-            if (!encoder) return false;
-            new_lookup.emplace(connector.id(), encoder.crtc_id());
+        auto it = mConnectorCrtcLookup.find(connector.id());
+        if (it != mConnectorCrtcLookup.end()) {
+          if (!connector.is_connected()) {
+            // Someone unplugged it!
+            mUnusedCrtcs.insert(it->second);
+            mConnectorCrtcLookup.erase(it);
           }
-          return false;
+        } else if (connector.is_connected()) {
+          // Someone plugged it in!
+          auto mode = connector.find_best_mode();
+          if (!mode) continue;
+
+          auto crtc_id = find_crtc_for_connector(resources, connector);
+          if (!crtc_id) continue;
+
+          set_mode(connector.id(), *crtc_id);
+          mUnusedCrtcs.erase(*crtc_id);
+          mConnectorCrtcLookup.emplace(connector.id(), *crtc_id);
         }
-      );
-      mConnectorCrtcLookup = std::move(new_lookup);
+      }
     }
   };
 
