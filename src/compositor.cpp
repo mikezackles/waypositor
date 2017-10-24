@@ -1,6 +1,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 #include <cassert>
 #include <cstdlib>
@@ -46,11 +47,11 @@ namespace {
       if (*this) close(mHandle);
     }
 
-    explicit operator bool() {
+    explicit operator bool() const {
       return mHandle >= 0;
     }
 
-    int get() {
+    int get() const {
       assert(*this);
       return mHandle;
     }
@@ -58,10 +59,14 @@ namespace {
 
   class DirectRenderingManager {
   private:
+    //struct Connection {
+    //  drmModeModeInfo &mModeInfo;
+    //  uint32_t mCRTControllerID;
+    //  uint32_t mConnectorID;
+    //};
+
     FileDescriptor mDescriptor;
-    drmModeModeInfo &mModeInfo;
-    uint32_t mCRTControllerID;
-    uint32_t mConnectorID;
+    std::unordered_map<uint32_t, uint32_t> mConnectorCrtcLookup;
 
     class Encoder {
     private:
@@ -167,22 +172,6 @@ namespace {
       }
     };
 
-    static Connector find_connector(int file_descriptor, Resources &resources) {
-      // Just choose the first connection for now
-      Connector result{};
-      resources.each_connector(
-        file_descriptor
-      , [&](Connector connector) {
-          if (connector.is_connected()) {
-            result = std::move(connector);
-            return true;
-          } else return false;
-        }
-      );
-      if (!result) std::cerr << "No connected connector" << std::endl;
-      return result;
-    }
-
     static auto find_encoder(
       int file_descriptor
     , Resources const &resources
@@ -202,34 +191,45 @@ namespace {
       return result;
     }
 
+  public:
     DirectRenderingManager(
-      FileDescriptor descriptor, drmModeModeInfo &mode_info
-    , uint32_t crt_controller_id, uint32_t connector_id
-    ) : mDescriptor{std::move(descriptor)}, mModeInfo{mode_info}
-      , mCRTControllerID{crt_controller_id}, mConnectorID{connector_id}
+      FileDescriptor descriptor
+    ) : mDescriptor{std::move(descriptor)}, mConnectorCrtcLookup{}
     {}
 
-  public:
-    static std::optional<DirectRenderingManager> create(char const *path) {
-      FileDescriptor descriptor{path};
-      if (!descriptor) return std::nullopt;
+    explicit operator bool() const { return static_cast<bool>(mDescriptor); }
 
-      Resources resources{descriptor.get()};
-      if (!resources) return std::nullopt;
+    void update_connections() {
+      assert (*this);
 
-      Connector connector = find_connector(descriptor.get(), resources);
-      if (!connector) return std::nullopt;
+      Resources resources{mDescriptor.get()};
+      if (!resources) return;
 
-      auto mode = connector.find_best_mode();
-      if (!mode) return std::nullopt;
+      std::unordered_map<uint32_t, uint32_t> new_lookup{};
+      resources.each_connector(
+        mDescriptor.get()
+      , [&](Connector connector) {
+          auto it = mConnectorCrtcLookup.find(connector.id());
+          if (it != mConnectorCrtcLookup.end()) {
+            auto node = mConnectorCrtcLookup.extract(it);
+            if (connector.is_connected()) {
+              new_lookup.insert(std::move(node));
+            }
+          } else if (connector.is_connected()) {
+            auto mode = connector.find_best_mode();
+            if (!mode) return false;
 
-      auto encoder = find_encoder(descriptor.get(), resources, connector);
-      // TODO - fancier stuff here
-      if (!encoder) return std::nullopt;
-
-      return DirectRenderingManager{
-        std::move(descriptor), *mode, encoder.crtc_id(), connector.id()
-      };
+            auto encoder = find_encoder(
+              mDescriptor.get(), resources, connector
+            );
+            // TODO - fancier stuff here
+            if (!encoder) return false;
+            new_lookup.emplace(connector.id(), encoder.crtc_id());
+          }
+          return false;
+        }
+      );
+      mConnectorCrtcLookup = std::move(new_lookup);
     }
   };
 
@@ -238,6 +238,7 @@ namespace {
 }
 
 int main() {
-  DirectRenderingManager::create("/dev/dri/card0");
+  DirectRenderingManager drm{"/dev/dri/card0"};
+  drm.update_connections();
   return EXIT_SUCCESS;
 }
