@@ -80,6 +80,38 @@ namespace {
   };
 
   namespace drm {
+    class Descriptor {
+    private:
+      FileDescriptor mFile;
+      Descriptor(FileDescriptor file) : mFile{std::move(file)} {}
+    public:
+      static std::optional<Descriptor> create(char const *path) {
+        FileDescriptor file{path};
+        if (!file) return std::nullopt;
+
+        int error = drmSetMaster(file.get());
+        if (error) {
+          perror("Couldn't become drm master!");
+          return std::nullopt;
+        }
+
+        return Descriptor{std::move(file)};
+      }
+      Descriptor(Descriptor const &) = delete;
+      Descriptor &operator=(Descriptor const &) = delete;
+      Descriptor(Descriptor &&) = default;
+      Descriptor &operator=(Descriptor &&) = default;
+      ~Descriptor() {
+        if (!*this) return;
+        int error = drmDropMaster(mFile.get());
+        if (error) perror("Error dropping drm master!");
+      }
+
+      explicit operator bool() const { return static_cast<bool>(mFile); }
+
+      int get() const { return mFile.get(); }
+    };
+
     class Encoder {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
@@ -89,9 +121,9 @@ namespace {
       std::unique_ptr<drmModeEncoder, decltype(&safe_delete)> mHandle;
     public:
       Encoder() : mHandle{nullptr, &safe_delete} {}
-      Encoder(FileDescriptor const &file_descriptor, uint32_t encoder_id)
+      Encoder(drm::Descriptor const &gpu, uint32_t encoder_id)
         : mHandle{
-            drmModeGetEncoder(file_descriptor.get(), encoder_id)
+            drmModeGetEncoder(gpu.get(), encoder_id)
           , &safe_delete
           }
       { if (!mHandle) perror("Couldn't get encoder"); }
@@ -118,9 +150,9 @@ namespace {
       ;
     public:
       Connector() : mHandle{nullptr, &safe_delete} {}
-      Connector(FileDescriptor const &file_descriptor, uint32_t connector_id)
+      Connector(drm::Descriptor const &gpu, uint32_t connector_id)
         : mHandle{
-            drmModeGetConnector(file_descriptor.get(), connector_id)
+            drmModeGetConnector(gpu.get(), connector_id)
           , &safe_delete
           }
       { if (!mHandle) perror("Couldn't get connector"); }
@@ -173,8 +205,8 @@ namespace {
       std::unique_ptr<drmModeRes, decltype(&safe_delete)> mHandle;
 
     public:
-      Resources(FileDescriptor const &file_descriptor)
-        : mHandle{drmModeGetResources(file_descriptor.get()), &safe_delete}
+      Resources(drm::Descriptor const &gpu)
+        : mHandle{drmModeGetResources(gpu.get()), &safe_delete}
       { if (!mHandle) perror("Couldn't retrieve DRM resources"); }
 
       explicit operator bool() const { return mHandle != nullptr; }
@@ -202,11 +234,11 @@ namespace {
     public:
       // Keeps a reference to FileDescriptor!
       FrameBuffer create(
-        FileDescriptor const &descriptor
+        drm::Descriptor const &gpu
       , uint32_t width, uint32_t height
       , uint32_t pitch, uint32_t bo_handle
       ) {
-        assert(descriptor);
+        assert(gpu);
 
         constexpr uint8_t depth = 24;
         constexpr uint8_t pixel_bits = 32;
@@ -214,7 +246,7 @@ namespace {
         // Note that there are more variants of this function
         // (currently drmModeAddFB2 and drmModeAddFB2WithModifiers)
         int error = drmModeAddFB(
-          descriptor.get()
+          gpu.get()
         , width, height
         , depth, pixel_bits, pitch
         , bo_handle, &framebuffer_id
@@ -224,7 +256,7 @@ namespace {
           return {};
         }
 
-        return {descriptor.get(), framebuffer_id};
+        return {gpu.get(), framebuffer_id};
       }
 
       explicit operator bool() const { return mGPUDescriptor >= 0; }
@@ -255,8 +287,8 @@ namespace {
       std::unique_ptr<struct gbm_device, decltype(&safe_delete)> mHandle;
     public:
       Device() : mHandle{nullptr, &safe_delete} {}
-      Device(FileDescriptor &descriptor)
-        : mHandle{gbm_create_device(descriptor.get()), &safe_delete}
+      Device(drm::Descriptor &gpu)
+        : mHandle{gbm_create_device(gpu.get()), &safe_delete}
       { if (!mHandle) std::cerr << "Failed to create GBM device" << std::endl; }
 
       explicit operator bool() const { return mHandle != nullptr; }
@@ -269,6 +301,9 @@ namespace {
       //struct gbm_device const &operator*() const { return *mHandle; }
     };
 
+    // This abstracts a swapchain. The C API keeps ownership of the underlying
+    // buffer objects, and of course there is no hook for buffer creation, so we
+    // end up attaching framebuffers to buffer objects on the fly :/
     class Surface {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
@@ -279,6 +314,7 @@ namespace {
     public:
       Surface(Device const &device, uint32_t width, uint32_t height)
         : mHandle{
+            // Note that gbm_surface_create_with_modifiers also exists
             gbm_surface_create(
               device.get(), width, height
             , // No transparency - 8-bit red, green, blue
@@ -315,7 +351,7 @@ namespace {
 
   class DeviceManager {
   private:
-    FileDescriptor mGPUDescriptor;
+    drm::Descriptor mGPUDescriptor;
     gbm::Device mGBM;
     std::unordered_map<uint32_t, Display> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
@@ -336,8 +372,8 @@ namespace {
       return std::nullopt;
     }
 
-    DeviceManager(FileDescriptor descriptor, std::set<uint32_t> unused_crtcs)
-      : mGPUDescriptor{std::move(descriptor)}
+    DeviceManager(drm::Descriptor gpu, std::set<uint32_t> unused_crtcs)
+      : mGPUDescriptor{std::move(gpu)}
       , mGBM{mGPUDescriptor}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
@@ -345,16 +381,16 @@ namespace {
 
   public:
     static std::optional<DeviceManager> create(char const *path) {
-      FileDescriptor descriptor{path};
-      if (!descriptor) return std::nullopt;
+      auto gpu = drm::Descriptor::create(path);
+      if (!gpu) return std::nullopt;
 
-      drm::Resources resources{descriptor};
+      drm::Resources resources{*gpu};
       if (!resources) return std::nullopt;
 
       std::set<uint32_t> unused_crtcs{};
       for (uint32_t crtc_id : resources.crtcs()) unused_crtcs.insert(crtc_id);
 
-      return DeviceManager{std::move(descriptor), std::move(unused_crtcs)};
+      return DeviceManager{std::move(*gpu), std::move(unused_crtcs)};
     }
 
     explicit operator bool() const { return static_cast<bool>(mGPUDescriptor); }
