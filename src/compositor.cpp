@@ -224,16 +224,28 @@ namespace {
 
     class FrameBuffer {
     private:
-      int mGPUDescriptor;
-      uint32_t mHandle;
+      class Handle {
+      private:
+        int mGPUDescriptor;
+        uint32_t mFramebufferHandle;
+      public:
+        Handle(int gpu, uint32_t framebuffer)
+          : mGPUDescriptor{gpu}, mFramebufferHandle{framebuffer}
+        {}
+        ~Handle() {
+          drmModeRmFB(mGPUDescriptor, mFramebufferHandle);
+        }
+      };
+      Handle mHandle;
 
-      FrameBuffer() : mGPUDescriptor{-1}, mHandle{0} {}
-      FrameBuffer(int descriptor, uint32_t handle)
-        : mGPUDescriptor{descriptor}, mHandle{handle}
+      FrameBuffer(int gpu, uint32_t framebuffer)
+        : mHandle{gpu, framebuffer}
       {}
     public:
-      // Keeps a reference to FileDescriptor!
-      FrameBuffer create(
+      // This is heap allocated to interact with the gbm C API. Note that it
+      // keeps a reference to the gpu descriptor, so its use should be limited
+      // to the scope of the owner of the gpu descriptor.
+      static FrameBuffer *create(
         drm::Descriptor const &gpu
       , uint32_t width, uint32_t height
       , uint32_t pitch, uint32_t bo_handle
@@ -253,27 +265,11 @@ namespace {
         );
         if (error) {
           perror("Failed to create framebuffer");
-          return {};
+          return nullptr;
         }
 
-        return {gpu.get(), framebuffer_id};
+        return new FrameBuffer{gpu.get(), framebuffer_id};
       }
-
-      explicit operator bool() const { return mGPUDescriptor >= 0; }
-
-      FrameBuffer(FrameBuffer const &) = delete;
-      FrameBuffer &operator=(FrameBuffer const &) = delete;
-      FrameBuffer(FrameBuffer &&other) noexcept
-        : mGPUDescriptor{other.mGPUDescriptor}, mHandle{other.mHandle}
-      { other.mGPUDescriptor = -1; }
-      FrameBuffer &operator=(FrameBuffer &&other) noexcept {
-        if (&other == this) return *this;
-        if (*this) drmModeRmFB(mGPUDescriptor, mHandle);
-        mGPUDescriptor = other.mGPUDescriptor;
-        mHandle = other.mHandle;
-        other.mGPUDescriptor = -1;
-      }
-      ~FrameBuffer() { if (*this) drmModeRmFB(mGPUDescriptor, mHandle); }
     };
   }
 
@@ -281,10 +277,10 @@ namespace {
     class Device {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
-      static void safe_delete(struct gbm_device *device) {
+      static void safe_delete(gbm_device *device) {
         if (device != nullptr) gbm_device_destroy(device);
       }
-      std::unique_ptr<struct gbm_device, decltype(&safe_delete)> mHandle;
+      std::unique_ptr<gbm_device, decltype(&safe_delete)> mHandle;
     public:
       Device() : mHandle{nullptr, &safe_delete} {}
       Device(drm::Descriptor &gpu)
@@ -293,24 +289,79 @@ namespace {
 
       explicit operator bool() const { return mHandle != nullptr; }
 
-      struct gbm_device *get() const {
+      gbm_device *get() const {
         assert(*this);
         return mHandle.get();
       }
-      //struct gbm_device &operator*() { return *mHandle; }
-      //struct gbm_device const &operator*() const { return *mHandle; }
     };
 
-    // This abstracts a swapchain. The C API keeps ownership of the underlying
-    // buffer objects, and of course there is no hook for buffer creation, so we
-    // end up attaching framebuffers to buffer objects on the fly :/
+    class FrontBuffer {
+    private:
+      class Handle {
+      private:
+        gbm_surface &mSurface;
+        gbm_bo &mBuffer;
+      public:
+        gbm_bo *get() { return &mBuffer; }
+
+        Handle(gbm_surface &surface, gbm_bo &buffer)
+          : mSurface{surface}, mBuffer{buffer}
+        {}
+        ~Handle() {
+          gbm_surface_release_buffer(&mSurface, &mBuffer);
+        }
+      };
+      Handle mHandle;
+
+      FrontBuffer(gbm_surface &surface, gbm_bo &buffer)
+        : mHandle{surface, buffer}
+      {}
+    public:
+      static std::optional<FrontBuffer> create(gbm_surface &surface) {
+        gbm_bo *buffer = gbm_surface_lock_front_buffer(&surface);
+        if (buffer == nullptr) {
+          std::cerr << "Failed to lock front buffer!" << std::endl;
+          return std::nullopt;
+        }
+        return FrontBuffer{surface, *buffer};
+      }
+
+      // The C API keeps ownership of the underlying buffer objects, and of
+      // course there is no hook for buffer creation, so we end up attaching
+      // framebuffers to buffer objects on the fly. This returns nullptr on
+      // error.
+      drm::FrameBuffer *ensure_framebuffer(drm::Descriptor const &gpu) {
+        auto framebuffer = static_cast<drm::FrameBuffer *>(
+          gbm_bo_get_user_data(mHandle.get())
+        );
+        if (framebuffer != nullptr) return framebuffer;
+        framebuffer = drm::FrameBuffer::create(
+          gpu
+        , gbm_bo_get_width(mHandle.get())
+        , gbm_bo_get_height(mHandle.get())
+        , gbm_bo_get_stride(mHandle.get())
+        , gbm_bo_get_handle(mHandle.get()).u32
+        );
+        if (framebuffer == nullptr) return nullptr;
+        gbm_bo_set_user_data(
+          mHandle.get(), framebuffer
+        , // This is the deleter
+          [](gbm_bo *, void *framebuffer) {
+            if (framebuffer == nullptr) return;
+            delete static_cast<drm::FrameBuffer *>(framebuffer);
+          }
+        );
+      }
+    };
+
+    // This abstracts a swapchain.
     class Surface {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
-      static void safe_delete(struct gbm_surface *surface) {
+      static void safe_delete(gbm_surface *surface) {
         if (surface != nullptr) gbm_surface_destroy(surface);
       }
-      std::unique_ptr<struct gbm_surface, decltype(&safe_delete)> mHandle;
+      std::unique_ptr<gbm_surface, decltype(&safe_delete)> mHandle;
     public:
       Surface(Device const &device, uint32_t width, uint32_t height)
         : mHandle{
@@ -332,8 +383,10 @@ namespace {
 
       explicit operator bool() const { return mHandle != nullptr; }
 
-      //struct gbm_surface &operator*() { return *mHandle; }
-      //struct gbm_surface const &operator*() const { return *mHandle; }
+      std::optional<FrontBuffer> lock_front_buffer() {
+        assert(*this);
+        return FrontBuffer::create(*mHandle);
+      }
     };
   }
 
