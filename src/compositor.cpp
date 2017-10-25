@@ -77,12 +77,7 @@ namespace {
     T const *end() const { return mEnd; }
   };
 
-  class DirectRenderingManager {
-  private:
-    FileDescriptor mDescriptor;
-    std::unordered_map<uint32_t, uint32_t> mLookup;
-    std::set<uint32_t> mUnusedCrtcs;
-
+  namespace drm {
     class Encoder {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
@@ -192,12 +187,19 @@ namespace {
         return {mHandle->crtcs, mHandle->count_crtcs};
       }
     };
+  }
+
+  class DirectRenderingManager {
+  private:
+    FileDescriptor mDescriptor;
+    std::unordered_map<uint32_t, uint32_t> mLookup;
+    std::set<uint32_t> mUnusedCrtcs;
 
     std::optional<uint32_t> find_crtc_for_connector(
-      Resources const &resources, Connector const &connector
+      drm::Resources const &resources, drm::Connector const &connector
     ) {
       for (uint32_t encoder_id : connector.encoders()) {
-        Encoder encoder{mDescriptor, encoder_id};
+        drm::Encoder encoder{mDescriptor, encoder_id};
         if (!encoder) continue;
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
@@ -222,7 +224,7 @@ namespace {
     ) : mDescriptor{std::move(descriptor)}, mLookup{}
       , mUnusedCrtcs{}
     {
-      Resources resources{mDescriptor};
+      drm::Resources resources{mDescriptor};
       if (!resources) return;
 
       for (uint32_t crtc_id : resources.crtcs()) mUnusedCrtcs.insert(crtc_id);
@@ -233,11 +235,11 @@ namespace {
     void update_connections() {
       assert (*this);
 
-      Resources resources{mDescriptor};
+      drm::Resources resources{mDescriptor};
       if (!resources) return;
 
       for (uint32_t connector_id : resources.connectors()) {
-        Connector connector{mDescriptor, connector_id};
+        drm::Connector connector{mDescriptor, connector_id};
         if (!connector) continue;
 
         if (auto it = mLookup.find(connector.id()); it != mLookup.end()) {
