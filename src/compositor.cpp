@@ -221,7 +221,6 @@ namespace {
       }
       std::unique_ptr<struct gbm_surface, decltype(&safe_delete)> mHandle;
     public:
-      Surface() : mHandle{nullptr, &safe_delete} {}
       Surface(Device const &device, uint32_t width, uint32_t height)
         : mHandle{
             gbm_surface_create(
@@ -239,16 +238,30 @@ namespace {
         if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl;
       }
 
+      explicit operator bool() const { return mHandle != nullptr; }
+
       //struct gbm_surface &operator*() { return *mHandle; }
       //struct gbm_surface const &operator*() const { return *mHandle; }
     };
   }
 
+  class Display {
+  private:
+    gbm::Surface mSurface;
+    uint32_t mCrtcID;
+  public:
+    Display(gbm::Surface surface, uint32_t crtc_id)
+      : mSurface{std::move(surface)}, mCrtcID{crtc_id}
+    {}
+
+    uint32_t crtc_id() const { return mCrtcID; }
+  };
+
   class DeviceManager {
   private:
     FileDescriptor mGPUDescriptor;
     gbm::Device mGBM;
-    std::unordered_map<uint32_t, uint32_t> mDisplayLookup;
+    std::unordered_map<uint32_t, Display> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
     std::optional<uint32_t> find_crtc_for_connector(
@@ -265,13 +278,6 @@ namespace {
         }
       }
       return std::nullopt;
-    }
-
-    void set_mode(
-      drmModeModeInfo &/*mode*/
-    , uint32_t /*connection_id*/
-    , uint32_t /*crtc_id*/
-    ) {
     }
 
     DeviceManager(FileDescriptor descriptor, std::set<uint32_t> unused_crtcs)
@@ -313,19 +319,25 @@ namespace {
         ) {
           if (!connector.is_connected()) {
             // Someone unplugged it!
-            mUnusedCrtcs.insert(it->second);
+            mUnusedCrtcs.insert(it->second.crtc_id());
             mDisplayLookup.erase(it);
           }
         } else if (connector.is_connected()) {
           // Someone plugged it in!
-          auto mode = connector.find_best_mode();
+          drmModeModeInfo *mode = connector.find_best_mode();
           if (!mode) continue;
 
           auto crtc_id = find_crtc_for_connector(resources, connector);
           if (!crtc_id) continue;
 
-          set_mode(*mode, connector.id(), *crtc_id);
-          mDisplayLookup.emplace(connector.id(), *crtc_id);
+          gbm::Surface surface{mGBM, mode->hdisplay, mode->vdisplay};
+          if (!surface) continue;
+
+          mDisplayLookup.emplace(
+            std::piecewise_construct
+          , std::forward_as_tuple(connector.id())
+          , std::forward_as_tuple(std::move(surface), *crtc_id)
+          );
           mUnusedCrtcs.erase(*crtc_id);
         }
       }
