@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <gbm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -248,8 +250,37 @@ namespace {
     }
   };
 
-  //class GraphicsBufferManager {
-  //};
+  class GBMDevice {
+  private:
+    std::unique_ptr<struct gbm_device, decltype(&gbm_device_destroy)> mHandle;
+  public:
+    GBMDevice() : mHandle{nullptr, &gbm_device_destroy} {}
+    GBMDevice(int descriptor)
+      : mHandle{gbm_create_device(descriptor), &gbm_device_destroy}
+    { if (!mHandle) std::cerr << "Failed to create GBM device" << std::endl; }
+
+    struct gbm_device &operator*() { return *mHandle; }
+    struct gbm_device const &operator*() const { return *mHandle; }
+  };
+
+  class GBMSurface {
+  private:
+    std::unique_ptr<struct gbm_surface, decltype(&gbm_surface_destroy)> mHandle;
+  public:
+    GBMSurface() : mHandle{nullptr, &gbm_surface_destroy} {}
+    GBMSurface(struct gbm_device *gbm, uint32_t width, uint32_t height)
+      : mHandle{
+          gbm_surface_create(
+            gbm, width, height, GBM_FORMAT_XRGB8888
+          , GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING
+          )
+        , &gbm_surface_destroy
+        }
+    { if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl; }
+
+    struct gbm_surface &operator*() { return *mHandle; }
+    struct gbm_surface const &operator*() const { return *mHandle; }
+  };
 }
 
 int main() {

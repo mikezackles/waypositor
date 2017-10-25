@@ -21,6 +21,7 @@ foreach flag : maybe_cpp_flags
 endforeach
 
 libdrm = dependency('libdrm', required : true)
+libgbm = dependency('gbm', required : true)
 
 executable(
   'ob-compositor'
@@ -28,7 +29,7 @@ executable(
 , install: true
 #, include_directories : include
 #, link_with : [liboblong_input]
-, dependencies : [libdrm]
+, dependencies : [libdrm, libgbm]
 , cpp_args : cpp_flags
 )
 
