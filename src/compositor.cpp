@@ -265,16 +265,23 @@ namespace {
     ) {
     }
 
-  public:
-    DeviceManager(
-      FileDescriptor descriptor
-    ) : mGPUDescriptor{std::move(descriptor)}, mLookup{}
-      , mUnusedCrtcs{}
-    {
-      drm::Resources resources{mGPUDescriptor};
-      if (!resources) return;
+    DeviceManager(FileDescriptor descriptor, std::set<uint32_t> unused_crtcs)
+      : mGPUDescriptor{std::move(descriptor)}, mLookup{}
+      , mUnusedCrtcs{std::move(unused_crtcs)}
+    {}
 
-      for (uint32_t crtc_id : resources.crtcs()) mUnusedCrtcs.insert(crtc_id);
+  public:
+    static std::optional<DeviceManager> create(char const *path) {
+      FileDescriptor descriptor{path};
+      if (!descriptor) return std::nullopt;
+
+      drm::Resources resources{descriptor};
+      if (!resources) return std::nullopt;
+
+      std::set<uint32_t> unused_crtcs{};
+      for (uint32_t crtc_id : resources.crtcs()) unused_crtcs.insert(crtc_id);
+
+      return DeviceManager{std::move(descriptor), std::move(unused_crtcs)};
     }
 
     explicit operator bool() const { return static_cast<bool>(mGPUDescriptor); }
@@ -313,7 +320,8 @@ namespace {
 }
 
 int main() {
-  DeviceManager drm{"/dev/dri/card0"};
-  drm.update_connections();
+  auto drm = DeviceManager::create("/dev/dri/card0");
+  if (!drm) return EXIT_FAILURE;
+  drm->update_connections();
   return EXIT_SUCCESS;
 }
