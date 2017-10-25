@@ -199,12 +199,18 @@ namespace {
       std::unique_ptr<struct gbm_device, decltype(&safe_delete)> mHandle;
     public:
       Device() : mHandle{nullptr, &safe_delete} {}
-      Device(int descriptor)
-        : mHandle{gbm_create_device(descriptor), &safe_delete}
+      Device(FileDescriptor &descriptor)
+        : mHandle{gbm_create_device(descriptor.get()), &safe_delete}
       { if (!mHandle) std::cerr << "Failed to create GBM device" << std::endl; }
 
-      struct gbm_device &operator*() { return *mHandle; }
-      struct gbm_device const &operator*() const { return *mHandle; }
+      explicit operator bool() const { return mHandle != nullptr; }
+
+      struct gbm_device *get() const {
+        assert(*this);
+        return mHandle.get();
+      }
+      //struct gbm_device &operator*() { return *mHandle; }
+      //struct gbm_device const &operator*() const { return *mHandle; }
     };
 
     class Surface {
@@ -216,10 +222,10 @@ namespace {
       std::unique_ptr<struct gbm_surface, decltype(&safe_delete)> mHandle;
     public:
       Surface() : mHandle{nullptr, &safe_delete} {}
-      Surface(struct gbm_device *gbm, uint32_t width, uint32_t height)
+      Surface(Device const &device, uint32_t width, uint32_t height)
         : mHandle{
             gbm_surface_create(
-              gbm, width, height
+              device.get(), width, height
             , // No transparency - 8-bit red, green, blue
               GBM_FORMAT_XRGB8888
             , // Buffer will be presented to the screen
@@ -229,17 +235,20 @@ namespace {
             )
           , &safe_delete
           }
-      { if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl; }
+      {
+        if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl;
+      }
 
-      struct gbm_surface &operator*() { return *mHandle; }
-      struct gbm_surface const &operator*() const { return *mHandle; }
+      //struct gbm_surface &operator*() { return *mHandle; }
+      //struct gbm_surface const &operator*() const { return *mHandle; }
     };
   }
 
   class DeviceManager {
   private:
     FileDescriptor mGPUDescriptor;
-    std::unordered_map<uint32_t, uint32_t> mLookup;
+    gbm::Device mGBM;
+    std::unordered_map<uint32_t, uint32_t> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
     std::optional<uint32_t> find_crtc_for_connector(
@@ -266,7 +275,9 @@ namespace {
     }
 
     DeviceManager(FileDescriptor descriptor, std::set<uint32_t> unused_crtcs)
-      : mGPUDescriptor{std::move(descriptor)}, mLookup{}
+      : mGPUDescriptor{std::move(descriptor)}
+      , mGBM{mGPUDescriptor}
+      , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
     {}
 
@@ -296,11 +307,14 @@ namespace {
         drm::Connector connector{mGPUDescriptor, connector_id};
         if (!connector) continue;
 
-        if (auto it = mLookup.find(connector.id()); it != mLookup.end()) {
+        if (
+          auto it = mDisplayLookup.find(connector.id());
+          it != mDisplayLookup.end()
+        ) {
           if (!connector.is_connected()) {
             // Someone unplugged it!
             mUnusedCrtcs.insert(it->second);
-            mLookup.erase(it);
+            mDisplayLookup.erase(it);
           }
         } else if (connector.is_connected()) {
           // Someone plugged it in!
@@ -311,7 +325,7 @@ namespace {
           if (!crtc_id) continue;
 
           set_mode(*mode, connector.id(), *crtc_id);
-          mLookup.emplace(connector.id(), *crtc_id);
+          mDisplayLookup.emplace(connector.id(), *crtc_id);
           mUnusedCrtcs.erase(*crtc_id);
         }
       }
