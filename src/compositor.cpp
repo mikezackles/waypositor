@@ -92,9 +92,9 @@ namespace {
       std::unique_ptr<drmModeEncoder, decltype(&safe_delete)> mHandle;
     public:
       Encoder() : mHandle{nullptr, &safe_delete} {}
-      Encoder(int file_descriptor, uint32_t encoder_id)
+      Encoder(FileDescriptor const &file_descriptor, uint32_t encoder_id)
         : mHandle{
-            drmModeGetEncoder(file_descriptor, encoder_id)
+            drmModeGetEncoder(file_descriptor.get(), encoder_id)
           , &safe_delete
           }
       { if (!mHandle) perror("Couldn't get encoder"); }
@@ -121,9 +121,9 @@ namespace {
       ;
     public:
       Connector() : mHandle{nullptr, &safe_delete} {}
-      Connector(int file_descriptor, uint32_t connector_id)
+      Connector(FileDescriptor const &file_descriptor, uint32_t connector_id)
         : mHandle{
-            drmModeGetConnector(file_descriptor, connector_id)
+            drmModeGetConnector(file_descriptor.get(), connector_id)
           , &safe_delete
           }
       { if (!mHandle) perror("Couldn't get connector"); }
@@ -176,8 +176,8 @@ namespace {
       std::unique_ptr<drmModeRes, decltype(&safe_delete)> mHandle;
 
     public:
-      Resources(int file_descriptor)
-        : mHandle{drmModeGetResources(file_descriptor), &safe_delete}
+      Resources(FileDescriptor const &file_descriptor)
+        : mHandle{drmModeGetResources(file_descriptor.get()), &safe_delete}
       { if (!mHandle) perror("Couldn't retrieve DRM resources"); }
 
       explicit operator bool() const { return mHandle != nullptr; }
@@ -197,7 +197,7 @@ namespace {
       Resources const &resources, Connector const &connector
     ) {
       for (uint32_t encoder_id : connector.encoders()) {
-        Encoder encoder{mDescriptor.get(), encoder_id};
+        Encoder encoder{mDescriptor, encoder_id};
         if (!encoder) continue;
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
@@ -222,7 +222,7 @@ namespace {
     ) : mDescriptor{std::move(descriptor)}, mLookup{}
       , mUnusedCrtcs{}
     {
-      Resources resources{mDescriptor.get()};
+      Resources resources{mDescriptor};
       if (!resources) return;
 
       for (uint32_t crtc_id : resources.crtcs()) mUnusedCrtcs.insert(crtc_id);
@@ -233,11 +233,11 @@ namespace {
     void update_connections() {
       assert (*this);
 
-      Resources resources{mDescriptor.get()};
+      Resources resources{mDescriptor};
       if (!resources) return;
 
       for (uint32_t connector_id : resources.connectors()) {
-        Connector connector{mDescriptor.get(), connector_id};
+        Connector connector{mDescriptor, connector_id};
         if (!connector) continue;
 
         if (auto it = mLookup.find(connector.id()); it != mLookup.end()) {
