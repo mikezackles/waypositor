@@ -85,13 +85,17 @@ namespace {
 
     class Encoder {
     private:
-      std::unique_ptr<drmModeEncoder, decltype(&drmModeFreeEncoder)> mHandle;
+      // I'm not sure what guarantees we have -- better safe than sorry
+      static void safe_delete(drmModeEncoder *encoder) {
+        if (encoder != nullptr) drmModeFreeEncoder(encoder);
+      }
+      std::unique_ptr<drmModeEncoder, decltype(&safe_delete)> mHandle;
     public:
-      Encoder() : mHandle{nullptr, &drmModeFreeEncoder} {}
+      Encoder() : mHandle{nullptr, &safe_delete} {}
       Encoder(int file_descriptor, uint32_t encoder_id)
         : mHandle{
             drmModeGetEncoder(file_descriptor, encoder_id)
-          , &drmModeFreeEncoder
+          , &safe_delete
           }
       { if (!mHandle) perror("Couldn't get encoder"); }
 
@@ -108,15 +112,19 @@ namespace {
 
     class Connector {
     private:
-      std::unique_ptr<drmModeConnector, decltype(&drmModeFreeConnector)>
+      // I'm not sure what guarantees we have -- better safe than sorry
+      static void safe_delete(drmModeConnector *connector) {
+        if (connector != nullptr) drmModeFreeConnector(connector);
+      }
+      std::unique_ptr<drmModeConnector, decltype(&safe_delete)>
         mHandle
       ;
     public:
-      Connector() : mHandle{nullptr, &drmModeFreeConnector} {}
+      Connector() : mHandle{nullptr, &safe_delete} {}
       Connector(int file_descriptor, uint32_t connector_id)
         : mHandle{
             drmModeGetConnector(file_descriptor, connector_id)
-          , &drmModeFreeConnector
+          , &safe_delete
           }
       { if (!mHandle) perror("Couldn't get connector"); }
 
@@ -161,11 +169,15 @@ namespace {
 
     class Resources {
     private:
-      std::unique_ptr<drmModeRes, decltype(&drmModeFreeResources)> mHandle;
+      // I'm not sure what guarantees we have -- better safe than sorry
+      static void safe_delete(drmModeRes *resources) {
+        if (resources != nullptr) drmModeFreeResources(resources);
+      }
+      std::unique_ptr<drmModeRes, decltype(&safe_delete)> mHandle;
 
     public:
       Resources(int file_descriptor)
-        : mHandle{drmModeGetResources(file_descriptor), &drmModeFreeResources}
+        : mHandle{drmModeGetResources(file_descriptor), &safe_delete}
       { if (!mHandle) perror("Couldn't retrieve DRM resources"); }
 
       explicit operator bool() const { return mHandle != nullptr; }
@@ -252,11 +264,15 @@ namespace {
 
   class GBMDevice {
   private:
-    std::unique_ptr<struct gbm_device, decltype(&gbm_device_destroy)> mHandle;
+    // I'm not sure what guarantees we have -- better safe than sorry
+    static void safe_delete(struct gbm_device *device) {
+      if (device != nullptr) gbm_device_destroy(device);
+    }
+    std::unique_ptr<struct gbm_device, decltype(&safe_delete)> mHandle;
   public:
-    GBMDevice() : mHandle{nullptr, &gbm_device_destroy} {}
+    GBMDevice() : mHandle{nullptr, &safe_delete} {}
     GBMDevice(int descriptor)
-      : mHandle{gbm_create_device(descriptor), &gbm_device_destroy}
+      : mHandle{gbm_create_device(descriptor), &safe_delete}
     { if (!mHandle) std::cerr << "Failed to create GBM device" << std::endl; }
 
     struct gbm_device &operator*() { return *mHandle; }
@@ -265,16 +281,25 @@ namespace {
 
   class GBMSurface {
   private:
-    std::unique_ptr<struct gbm_surface, decltype(&gbm_surface_destroy)> mHandle;
+    // I'm not sure what guarantees we have -- better safe than sorry
+    static void safe_delete(struct gbm_surface *surface) {
+      if (surface != nullptr) gbm_surface_destroy(surface);
+    }
+    std::unique_ptr<struct gbm_surface, decltype(&safe_delete)> mHandle;
   public:
-    GBMSurface() : mHandle{nullptr, &gbm_surface_destroy} {}
+    GBMSurface() : mHandle{nullptr, &safe_delete} {}
     GBMSurface(struct gbm_device *gbm, uint32_t width, uint32_t height)
       : mHandle{
           gbm_surface_create(
-            gbm, width, height, GBM_FORMAT_XRGB8888
-          , GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING
+            gbm, width, height
+          , // No transparency - 8-bit red, green, blue
+            GBM_FORMAT_XRGB8888
+          , // Buffer will be presented to the screen
+            GBM_BO_USE_SCANOUT |
+            // Buffer is to be used for rendering
+            GBM_BO_USE_RENDERING
           )
-        , &gbm_surface_destroy
+        , &safe_delete
         }
     { if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl; }
 
