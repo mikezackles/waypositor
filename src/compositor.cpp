@@ -35,13 +35,15 @@ namespace {
     }
 
     FileDescriptor(FileDescriptor const &) = delete;
-    FileDescriptor(FileDescriptor &&other)
+    FileDescriptor(FileDescriptor &&other) noexcept
       : mHandle{other.mHandle}
     {
       other.mHandle = -1;
     }
     FileDescriptor &operator=(FileDescriptor const &) = delete;
-    FileDescriptor &operator=(FileDescriptor &&other) {
+    FileDescriptor &operator=(FileDescriptor &&other) noexcept {
+      if (&other == this) return *this;
+      if (*this) close(mHandle);
       mHandle = other.mHandle;
       other.mHandle = -1;
       return *this;
@@ -186,6 +188,60 @@ namespace {
         assert(*this);
         return {mHandle->crtcs, mHandle->count_crtcs};
       }
+    };
+
+    class FrameBuffer {
+    private:
+      int mGPUDescriptor;
+      uint32_t mHandle;
+
+      FrameBuffer() : mGPUDescriptor{-1}, mHandle{0} {}
+      FrameBuffer(int descriptor, uint32_t handle)
+        : mGPUDescriptor{descriptor}, mHandle{handle}
+      {}
+    public:
+      // Keeps a reference to FileDescriptor!
+      FrameBuffer create(
+        FileDescriptor const &descriptor
+      , uint32_t width, uint32_t height
+      , uint32_t pitch, uint32_t bo_handle
+      ) {
+        assert(descriptor);
+
+        constexpr uint8_t depth = 24;
+        constexpr uint8_t pixel_bits = 32;
+        uint32_t framebuffer_id;
+        // Note that there are more variants of this function
+        // (currently drmModeAddFB2 and drmModeAddFB2WithModifiers)
+        int error = drmModeAddFB(
+          descriptor.get()
+        , width, height
+        , depth, pixel_bits, pitch
+        , bo_handle, &framebuffer_id
+        );
+        if (error) {
+          perror("Failed to create framebuffer");
+          return {};
+        }
+
+        return {descriptor.get(), framebuffer_id};
+      }
+
+      explicit operator bool() const { return mGPUDescriptor >= 0; }
+
+      FrameBuffer(FrameBuffer const &) = delete;
+      FrameBuffer &operator=(FrameBuffer const &) = delete;
+      FrameBuffer(FrameBuffer &&other) noexcept
+        : mGPUDescriptor{other.mGPUDescriptor}, mHandle{other.mHandle}
+      { other.mGPUDescriptor = -1; }
+      FrameBuffer &operator=(FrameBuffer &&other) noexcept {
+        if (&other == this) return *this;
+        if (*this) drmModeRmFB(mGPUDescriptor, mHandle);
+        mGPUDescriptor = other.mGPUDescriptor;
+        mHandle = other.mHandle;
+        other.mGPUDescriptor = -1;
+      }
+      ~FrameBuffer() { if (*this) drmModeRmFB(mGPUDescriptor, mHandle); }
     };
   }
 
