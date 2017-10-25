@@ -236,9 +236,9 @@ namespace {
     };
   }
 
-  class DirectRenderingManager {
+  class DeviceManager {
   private:
-    FileDescriptor mDescriptor;
+    FileDescriptor mGPUDescriptor;
     std::unordered_map<uint32_t, uint32_t> mLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
@@ -246,7 +246,7 @@ namespace {
       drm::Resources const &resources, drm::Connector const &connector
     ) {
       for (uint32_t encoder_id : connector.encoders()) {
-        drm::Encoder encoder{mDescriptor, encoder_id};
+        drm::Encoder encoder{mGPUDescriptor, encoder_id};
         if (!encoder) continue;
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
@@ -266,27 +266,27 @@ namespace {
     }
 
   public:
-    DirectRenderingManager(
+    DeviceManager(
       FileDescriptor descriptor
-    ) : mDescriptor{std::move(descriptor)}, mLookup{}
+    ) : mGPUDescriptor{std::move(descriptor)}, mLookup{}
       , mUnusedCrtcs{}
     {
-      drm::Resources resources{mDescriptor};
+      drm::Resources resources{mGPUDescriptor};
       if (!resources) return;
 
       for (uint32_t crtc_id : resources.crtcs()) mUnusedCrtcs.insert(crtc_id);
     }
 
-    explicit operator bool() const { return static_cast<bool>(mDescriptor); }
+    explicit operator bool() const { return static_cast<bool>(mGPUDescriptor); }
 
     void update_connections() {
       assert (*this);
 
-      drm::Resources resources{mDescriptor};
+      drm::Resources resources{mGPUDescriptor};
       if (!resources) return;
 
       for (uint32_t connector_id : resources.connectors()) {
-        drm::Connector connector{mDescriptor, connector_id};
+        drm::Connector connector{mGPUDescriptor, connector_id};
         if (!connector) continue;
 
         if (auto it = mLookup.find(connector.id()); it != mLookup.end()) {
@@ -313,7 +313,7 @@ namespace {
 }
 
 int main() {
-  DirectRenderingManager drm{"/dev/dri/card0"};
+  DeviceManager drm{"/dev/dri/card0"};
   drm.update_connections();
   return EXIT_SUCCESS;
 }
