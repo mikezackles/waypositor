@@ -78,7 +78,7 @@ namespace {
   class DirectRenderingManager {
   private:
     FileDescriptor mDescriptor;
-    std::unordered_map<uint32_t, uint32_t> mConnectorCrtcLookup;
+    std::unordered_map<uint32_t, uint32_t> mLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
     class Encoder {
@@ -121,12 +121,17 @@ namespace {
       explicit operator bool() const { return mHandle != nullptr; }
 
       bool is_connected() const {
+        assert(*this);
         return mHandle->connection == DRM_MODE_CONNECTED;
       }
 
-      uint32_t id() const { return mHandle->connector_id; }
+      uint32_t id() const {
+        assert(*this);
+        return mHandle->connector_id;
+      }
 
       uint32_t encoder_id() const {
+        assert(*this);
         return mHandle->encoder_id;
       }
 
@@ -182,9 +187,7 @@ namespace {
         if (!encoder) continue;
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
-          bool unused =
-            mUnusedCrtcs.find(crtc_id) == mUnusedCrtcs.end()
-          ;
+          bool unused = mUnusedCrtcs.find(crtc_id) == mUnusedCrtcs.end();
           if (encoder.has_crtc(i) && unused) return crtc_id;
           ++i;
         }
@@ -192,24 +195,23 @@ namespace {
       return std::nullopt;
     }
 
-    void set_mode(uint32_t /*connection_id*/, uint32_t /*crtc_id*/) {
+    void set_mode(
+      drmModeModeInfo &/*mode*/
+    , uint32_t /*connection_id*/
+    , uint32_t /*crtc_id*/
+    ) {
     }
 
   public:
     DirectRenderingManager(
       FileDescriptor descriptor
-    ) : mDescriptor{std::move(descriptor)}, mConnectorCrtcLookup{}
+    ) : mDescriptor{std::move(descriptor)}, mLookup{}
       , mUnusedCrtcs{}
     {
-      // Populate the unused crtc list
-      if (!mDescriptor) return;
-
       Resources resources{mDescriptor.get()};
       if (!resources) return;
 
-      for (uint32_t crtc_id : resources.crtcs()) {
-        mUnusedCrtcs.insert(crtc_id);
-      }
+      for (uint32_t crtc_id : resources.crtcs()) mUnusedCrtcs.insert(crtc_id);
     }
 
     explicit operator bool() const { return static_cast<bool>(mDescriptor); }
@@ -224,12 +226,11 @@ namespace {
         Connector connector{mDescriptor.get(), connector_id};
         if (!connector) continue;
 
-        auto it = mConnectorCrtcLookup.find(connector.id());
-        if (it != mConnectorCrtcLookup.end()) {
+        if (auto it = mLookup.find(connector.id()); it != mLookup.end()) {
           if (!connector.is_connected()) {
             // Someone unplugged it!
             mUnusedCrtcs.insert(it->second);
-            mConnectorCrtcLookup.erase(it);
+            mLookup.erase(it);
           }
         } else if (connector.is_connected()) {
           // Someone plugged it in!
@@ -239,9 +240,9 @@ namespace {
           auto crtc_id = find_crtc_for_connector(resources, connector);
           if (!crtc_id) continue;
 
-          set_mode(connector.id(), *crtc_id);
+          set_mode(*mode, connector.id(), *crtc_id);
+          mLookup.emplace(connector.id(), *crtc_id);
           mUnusedCrtcs.erase(*crtc_id);
-          mConnectorCrtcLookup.emplace(connector.id(), *crtc_id);
         }
       }
     }
