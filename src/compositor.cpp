@@ -189,6 +189,53 @@ namespace {
     };
   }
 
+  namespace gbm {
+    class Device {
+    private:
+      // I'm not sure what guarantees we have -- better safe than sorry
+      static void safe_delete(struct gbm_device *device) {
+        if (device != nullptr) gbm_device_destroy(device);
+      }
+      std::unique_ptr<struct gbm_device, decltype(&safe_delete)> mHandle;
+    public:
+      Device() : mHandle{nullptr, &safe_delete} {}
+      Device(int descriptor)
+        : mHandle{gbm_create_device(descriptor), &safe_delete}
+      { if (!mHandle) std::cerr << "Failed to create GBM device" << std::endl; }
+
+      struct gbm_device &operator*() { return *mHandle; }
+      struct gbm_device const &operator*() const { return *mHandle; }
+    };
+
+    class Surface {
+    private:
+      // I'm not sure what guarantees we have -- better safe than sorry
+      static void safe_delete(struct gbm_surface *surface) {
+        if (surface != nullptr) gbm_surface_destroy(surface);
+      }
+      std::unique_ptr<struct gbm_surface, decltype(&safe_delete)> mHandle;
+    public:
+      Surface() : mHandle{nullptr, &safe_delete} {}
+      Surface(struct gbm_device *gbm, uint32_t width, uint32_t height)
+        : mHandle{
+            gbm_surface_create(
+              gbm, width, height
+            , // No transparency - 8-bit red, green, blue
+              GBM_FORMAT_XRGB8888
+            , // Buffer will be presented to the screen
+              GBM_BO_USE_SCANOUT |
+              // Buffer is to be used for rendering
+              GBM_BO_USE_RENDERING
+            )
+          , &safe_delete
+          }
+      { if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl; }
+
+      struct gbm_surface &operator*() { return *mHandle; }
+      struct gbm_surface const &operator*() const { return *mHandle; }
+    };
+  }
+
   class DirectRenderingManager {
   private:
     FileDescriptor mDescriptor;
@@ -262,51 +309,6 @@ namespace {
         }
       }
     }
-  };
-
-  class GBMDevice {
-  private:
-    // I'm not sure what guarantees we have -- better safe than sorry
-    static void safe_delete(struct gbm_device *device) {
-      if (device != nullptr) gbm_device_destroy(device);
-    }
-    std::unique_ptr<struct gbm_device, decltype(&safe_delete)> mHandle;
-  public:
-    GBMDevice() : mHandle{nullptr, &safe_delete} {}
-    GBMDevice(int descriptor)
-      : mHandle{gbm_create_device(descriptor), &safe_delete}
-    { if (!mHandle) std::cerr << "Failed to create GBM device" << std::endl; }
-
-    struct gbm_device &operator*() { return *mHandle; }
-    struct gbm_device const &operator*() const { return *mHandle; }
-  };
-
-  class GBMSurface {
-  private:
-    // I'm not sure what guarantees we have -- better safe than sorry
-    static void safe_delete(struct gbm_surface *surface) {
-      if (surface != nullptr) gbm_surface_destroy(surface);
-    }
-    std::unique_ptr<struct gbm_surface, decltype(&safe_delete)> mHandle;
-  public:
-    GBMSurface() : mHandle{nullptr, &safe_delete} {}
-    GBMSurface(struct gbm_device *gbm, uint32_t width, uint32_t height)
-      : mHandle{
-          gbm_surface_create(
-            gbm, width, height
-          , // No transparency - 8-bit red, green, blue
-            GBM_FORMAT_XRGB8888
-          , // Buffer will be presented to the screen
-            GBM_BO_USE_SCANOUT |
-            // Buffer is to be used for rendering
-            GBM_BO_USE_RENDERING
-          )
-        , &safe_delete
-        }
-    { if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl; }
-
-    struct gbm_surface &operator*() { return *mHandle; }
-    struct gbm_surface const &operator*() const { return *mHandle; }
   };
 }
 
