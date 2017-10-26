@@ -227,13 +227,14 @@ namespace {
       class Handle {
       private:
         int mGPUDescriptor;
-        uint32_t mFramebufferHandle;
+        uint32_t mFrameBufferHandle;
       public:
+        uint32_t get() const { return mFrameBufferHandle; }
         Handle(int gpu, uint32_t framebuffer)
-          : mGPUDescriptor{gpu}, mFramebufferHandle{framebuffer}
+          : mGPUDescriptor{gpu}, mFrameBufferHandle{framebuffer}
         {}
         ~Handle() {
-          drmModeRmFB(mGPUDescriptor, mFramebufferHandle);
+          drmModeRmFB(mGPUDescriptor, mFrameBufferHandle);
         }
       };
       Handle mHandle;
@@ -242,6 +243,7 @@ namespace {
         : mHandle{gpu, framebuffer}
       {}
     public:
+      FrameBuffer() = default;
       // This is heap allocated to interact with the gbm C API. Note that it
       // keeps a reference to the gpu descriptor, so its use should be limited
       // to the scope of the owner of the gpu descriptor.
@@ -270,7 +272,66 @@ namespace {
 
         return new FrameBuffer{gpu.get(), framebuffer_id};
       }
+
+      uint32_t get() const { return mHandle.get(); }
     };
+
+    bool set_mode(
+      Descriptor const &gpu, FrameBuffer const &framebuffer
+    , uint32_t connector_id, uint32_t crtc_id, drmModeModeInfo &mode
+    ) {
+      int error = drmModeSetCrtc(
+        gpu.get(), crtc_id, framebuffer.get(), 0, 0, &connector_id, 1, &mode
+      );
+      if (error) {
+        perror("Failed to set mode");
+        return false;
+      } else {
+        return true;
+      }
+    }
+
+    // Holds a reference to page_flip_pending
+    bool begin_page_flip(
+      Descriptor const &gpu, FrameBuffer const &framebuffer
+    , uint32_t crtc_id, bool &page_flip_pending
+    ) {
+      int error = drmModePageFlip(
+        gpu.get(), crtc_id, framebuffer.get()
+      , DRM_MODE_PAGE_FLIP_EVENT, &page_flip_pending
+      );
+      if (error) {
+        perror("Page flip failed");
+        return false;
+      } else {
+        page_flip_pending = true;
+        return true;
+      }
+    }
+
+    namespace detail {
+      void mark_flip_no_longer_pending(
+        int /*gpu descriptor*/
+      , unsigned int /*frame*/
+      , unsigned int /*seconds*/
+      , unsigned int /*microseconds*/
+      , void *user_data
+      ) {
+        bool *flip_is_pending = static_cast<bool *>(user_data);
+        *flip_is_pending = false;
+      }
+      drmEventContext make_event_context() {
+        drmEventContext context;
+        context.version = 3;
+        context.page_flip_handler = &mark_flip_no_longer_pending;
+        return context;
+      }
+    }
+
+    bool handle_event(Descriptor const &gpu) {
+      static drmEventContext context = detail::make_event_context();
+      return drmHandleEvent(gpu.get(), &context);
+    }
   }
 
   namespace gbm {
@@ -299,29 +360,42 @@ namespace {
     private:
       class Handle {
       private:
-        gbm_surface &mSurface;
-        gbm_bo &mBuffer;
+        gbm_surface *mSurface;
+        gbm_bo *mBuffer;
       public:
-        gbm_bo *get() { return &mBuffer; }
+        gbm_bo *get() { return mBuffer; }
 
-        Handle(gbm_surface &surface, gbm_bo &buffer)
+        Handle(gbm_surface *surface, gbm_bo *buffer)
           : mSurface{surface}, mBuffer{buffer}
         {}
+        Handle() : Handle{nullptr, nullptr} {}
+        Handle(Handle const &) = delete;
+        Handle &operator=(Handle const &) = delete;
+        Handle(Handle &&) = default;
+        Handle &operator=(Handle &&) = default;
         ~Handle() {
-          gbm_surface_release_buffer(&mSurface, &mBuffer);
+          gbm_surface_release_buffer(mSurface, mBuffer);
+        }
+
+        explicit operator bool() const {
+          return mSurface != nullptr && mBuffer != nullptr;
         }
       };
       Handle mHandle;
 
       FrontBuffer(gbm_surface &surface, gbm_bo &buffer)
-        : mHandle{surface, buffer}
+        : mHandle{&surface, &buffer}
       {}
     public:
-      static std::optional<FrontBuffer> create(gbm_surface &surface) {
+      FrontBuffer() = default;
+
+      explicit operator bool() const { return static_cast<bool>(mHandle); }
+
+      static FrontBuffer create(gbm_surface &surface) {
         gbm_bo *buffer = gbm_surface_lock_front_buffer(&surface);
         if (buffer == nullptr) {
           std::cerr << "Failed to lock front buffer!" << std::endl;
-          return std::nullopt;
+          return FrontBuffer{};
         }
         return FrontBuffer{surface, *buffer};
       }
@@ -331,6 +405,8 @@ namespace {
       // framebuffers to buffer objects on the fly. This returns nullptr on
       // error.
       drm::FrameBuffer *ensure_framebuffer(drm::Descriptor const &gpu) {
+        assert(*this);
+
         auto framebuffer = static_cast<drm::FrameBuffer *>(
           gbm_bo_get_user_data(mHandle.get())
         );
@@ -383,7 +459,7 @@ namespace {
 
       explicit operator bool() const { return mHandle != nullptr; }
 
-      std::optional<FrontBuffer> lock_front_buffer() {
+      FrontBuffer lock_front_buffer() {
         assert(*this);
         return FrontBuffer::create(*mHandle);
       }
@@ -394,12 +470,59 @@ namespace {
   private:
     gbm::Surface mSurface;
     uint32_t mCrtcID;
+    uint32_t mConnectorID;
+    drmModeModeInfo &mMode;
+    gbm::FrontBuffer mCurrentFrontBuffer;
+    gbm::FrontBuffer mNextFrontBuffer;
+    bool mWaitingForPageFlip;
   public:
-    Display(gbm::Surface surface, uint32_t crtc_id)
-      : mSurface{std::move(surface)}, mCrtcID{crtc_id}
+    Display(
+      gbm::Surface surface
+    , uint32_t crtc_id, uint32_t connector_id
+    , drmModeModeInfo &mode
+    ) : mSurface{std::move(surface)}, mCrtcID{crtc_id}
+      , mConnectorID{connector_id}, mMode{mode}
+      , mCurrentFrontBuffer{}, mNextFrontBuffer{}
+      , mWaitingForPageFlip{false}
     {}
 
     uint32_t crtc_id() const { return mCrtcID; }
+
+    bool set_mode(drm::Descriptor const &gpu) {
+      // TODO - eglSwapBuffers!
+      auto front = mSurface.lock_front_buffer();
+      if (!front) return false;
+      auto framebuffer = front.ensure_framebuffer(gpu);
+      if (!framebuffer) return false;
+      if (drm::set_mode(gpu, *framebuffer, mConnectorID, mCrtcID, mMode)) {
+        mCurrentFrontBuffer = std::move(front);
+      } else {
+        return false;
+      }
+    }
+
+    bool begin_swap_buffers(drm::Descriptor const &gpu) {
+      assert(mCurrentFrontBuffer);
+      auto front = mSurface.lock_front_buffer();
+      if (!front) return false;
+      auto framebuffer = front.ensure_framebuffer(gpu);
+      if (!framebuffer) return false;
+      bool success = drm::begin_page_flip(
+        gpu, *framebuffer, mCrtcID, mWaitingForPageFlip
+      );
+      if (success) mNextFrontBuffer = std::move(front);
+      return success;
+    }
+
+    bool buffer_swap_is_pending() const { return mWaitingForPageFlip; }
+
+    bool handle_event(drm::Descriptor const &gpu) {
+      return drm::handle_event(gpu);
+    }
+
+    void finish_swap_buffers() {
+      mCurrentFrontBuffer = std::move(mNextFrontBuffer);
+    }
   };
 
   class DeviceManager {
@@ -451,7 +574,7 @@ namespace {
     explicit operator bool() const { return static_cast<bool>(mGPUDescriptor); }
 
     void update_connections() {
-      assert (*this);
+      assert(*this);
 
       drm::Resources resources{mGPUDescriptor};
       if (!resources) return;
@@ -483,7 +606,9 @@ namespace {
           mDisplayLookup.emplace(
             std::piecewise_construct
           , std::forward_as_tuple(connector.id())
-          , std::forward_as_tuple(std::move(surface), *crtc_id)
+          , std::forward_as_tuple(
+              std::move(surface), *crtc_id, connector.id(), *mode
+            )
           );
           mUnusedCrtcs.erase(*crtc_id);
         }
