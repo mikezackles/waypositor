@@ -1,8 +1,8 @@
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
-#include <unordered_map>
 
 #include <cassert>
 #include <cstdlib>
@@ -406,7 +406,9 @@ namespace {
   private:
     drm::Descriptor mGPUDescriptor;
     gbm::Device mGBM;
-    std::unordered_map<uint32_t, Display> mDisplayLookup;
+    // The keys here are connector ids returned from libdrm. The hope is that
+    // they are consistent across reboots etc.
+    std::map<uint32_t, Display> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
     std::optional<uint32_t> find_crtc_for_connector(
