@@ -517,10 +517,12 @@ namespace {
     bool buffer_swap_is_pending() const { return mWaitingForPageFlip; }
 
     bool handle_event(drm::Descriptor const &gpu) {
+      assert(mWaitingForPageFlip);
       return drm::handle_event(gpu);
     }
 
     void finish_swap_buffers() {
+      assert(!mWaitingForPageFlip);
       mCurrentFrontBuffer = std::move(mNextFrontBuffer);
     }
   };
