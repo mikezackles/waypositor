@@ -540,17 +540,11 @@ namespace {
           << eglQueryString(display, EGL_EXTENSIONS) << std::endl
         ;
 
-        success = eglBindAPI(EGL_OPENGL_ES_API);
-        if (!success) {
-          std::cerr << "Couldn't use OpenGL ES 3" << std::endl;
-          return {};
-        }
-
         return {display};
       }
     };
 
-    EGLConfig make_config(Display const &display) {
+    EGLConfig find_config(Display const &display) {
       static constexpr EGLint config_attributes[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT
       , EGL_RED_SIZE, 1
@@ -609,14 +603,21 @@ namespace {
       }
 
       EGLContext get() const { assert(*this); return mContext; }
-      EGLConfig config() const { assert(*this); return mConfig; }
 
       // Keeps a reference to the display!
+      // This function creates global, thread-local state! See ThreadContext.
       static Context create(
         Display const &display, EGLConfig config
       , Context const *shared_context = nullptr
       ) {
         assert(config != nullptr);
+
+        EGLBoolean success = eglBindAPI(EGL_OPENGL_ES_API);
+        if (!success) {
+          std::cerr << "Couldn't use OpenGL ES 3" << std::endl;
+          return {};
+        }
+
         static constexpr EGLint attributes[] = {
           EGL_CONTEXT_CLIENT_VERSION, 3
         , EGL_NONE
@@ -707,6 +708,7 @@ namespace {
 
       explicit operator bool() const { return mDisplay != nullptr; }
 
+      // This function creates global, thread-local state! See ThreadContext.
       static CurrentContext create(
         Display const &display, Surface const &surface, Context const &context
       ) {
@@ -727,14 +729,12 @@ namespace {
       static thread_local CurrentContext sCurrentContext;
 
     public:
+      // This function creates global, thread-local state!
       static Context make_current(
-        gbm::Device const &gbm, gbm::Surface const &gbm_surface
+        Display const &display, gbm::Surface const &gbm_surface
       , Context const *share_context = nullptr
       ) {
-        auto display = Display::create(gbm);
-        if (!display) return {};
-
-        EGLConfig config = make_config(display);
+        EGLConfig config = find_config(display);
         if (config == nullptr) return {};
 
         auto context = Context::create(display, config, share_context);
@@ -761,7 +761,7 @@ namespace {
     gbm::Surface mSurface;
     uint32_t mCrtcID;
     uint32_t mConnectorID;
-    drmModeModeInfo &mMode;
+    drmModeModeInfo *mMode;
     gbm::FrontBuffer mCurrentFrontBuffer;
     gbm::FrontBuffer mNextFrontBuffer;
     bool mWaitingForPageFlip;
@@ -771,20 +771,29 @@ namespace {
     , uint32_t crtc_id, uint32_t connector_id
     , drmModeModeInfo &mode
     ) : mSurface{std::move(surface)}, mCrtcID{crtc_id}
-      , mConnectorID{connector_id}, mMode{mode}
+      , mConnectorID{connector_id}, mMode{&mode}
       , mCurrentFrontBuffer{}, mNextFrontBuffer{}
       , mWaitingForPageFlip{false}
     {}
 
-    uint32_t crtc_id() const { return mCrtcID; }
+    explicit operator bool() const {
+      return
+          static_cast<bool>(mSurface)
+       && mMode != nullptr
+       && egl::ThreadContext::is_set()
+      ;
+    }
+
+    uint32_t crtc_id() const { assert(*this); return mCrtcID; }
 
     bool set_mode(drm::Descriptor const &gpu) {
+      assert(*this);
       // TODO - eglSwapBuffers!
       auto front = mSurface.lock_front_buffer();
       if (!front) return false;
       auto framebuffer = front.ensure_framebuffer(gpu);
       if (!framebuffer) return false;
-      if (drm::set_mode(gpu, *framebuffer, mConnectorID, mCrtcID, mMode)) {
+      if (drm::set_mode(gpu, *framebuffer, mConnectorID, mCrtcID, *mMode)) {
         mCurrentFrontBuffer = std::move(front);
         return true;
       } else {
@@ -793,6 +802,7 @@ namespace {
     }
 
     bool begin_swap_buffers(drm::Descriptor const &gpu) {
+      assert(*this);
       assert(mCurrentFrontBuffer);
       auto front = mSurface.lock_front_buffer();
       if (!front) return false;
@@ -805,14 +815,19 @@ namespace {
       return success;
     }
 
-    bool buffer_swap_is_pending() const { return mWaitingForPageFlip; }
+    bool buffer_swap_is_pending() const {
+      assert(*this);
+      return mWaitingForPageFlip;
+    }
 
     bool handle_event(drm::Descriptor const &gpu) {
+      assert(*this);
       assert(mWaitingForPageFlip);
       return drm::handle_event(gpu);
     }
 
     void finish_swap_buffers() {
+      assert(*this);
       assert(!mWaitingForPageFlip);
       mCurrentFrontBuffer = std::move(mNextFrontBuffer);
     }
