@@ -15,6 +15,11 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+
 namespace {
   template <typename Arg>
   void perror(Arg&& message) {
@@ -24,7 +29,7 @@ namespace {
     std::cerr << message << ": " << buffer << std::endl;
   }
 
-  class FileDescriptor {
+  class FileDescriptor final {
   private:
     int mHandle;
   public:
@@ -43,9 +48,8 @@ namespace {
     FileDescriptor &operator=(FileDescriptor const &) = delete;
     FileDescriptor &operator=(FileDescriptor &&other) noexcept {
       if (&other == this) return *this;
-      if (*this) close(mHandle);
-      mHandle = other.mHandle;
-      other.mHandle = -1;
+      this->~FileDescriptor();
+      new (this) FileDescriptor{std::move(other)};
       return *this;
     }
     ~FileDescriptor() {
@@ -63,7 +67,7 @@ namespace {
   };
 
   template <typename T>
-  class Span {
+  class Span final {
   private:
     T *mBegin;
     T *mEnd;
@@ -80,7 +84,7 @@ namespace {
   };
 
   namespace drm {
-    class Descriptor {
+    class Descriptor final {
     private:
       FileDescriptor mFile;
       Descriptor(FileDescriptor file) : mFile{std::move(file)} {}
@@ -112,7 +116,7 @@ namespace {
       int get() const { return mFile.get(); }
     };
 
-    class Encoder {
+    class Encoder final {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
       static void safe_delete(drmModeEncoder *encoder) {
@@ -139,7 +143,7 @@ namespace {
       }
     };
 
-    class Connector {
+    class Connector final {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
       static void safe_delete(drmModeConnector *connector) {
@@ -196,7 +200,7 @@ namespace {
       }
     };
 
-    class Resources {
+    class Resources final {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
       static void safe_delete(drmModeRes *resources) {
@@ -222,7 +226,7 @@ namespace {
       }
     };
 
-    class FrameBuffer {
+    class FrameBuffer final {
     private:
       class Handle {
       private:
@@ -335,7 +339,7 @@ namespace {
   }
 
   namespace gbm {
-    class Device {
+    class Device final {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
       static void safe_delete(gbm_device *device) {
@@ -356,14 +360,14 @@ namespace {
       }
     };
 
-    class FrontBuffer {
+    class FrontBuffer final {
     private:
       class Handle {
       private:
         gbm_surface *mSurface;
         gbm_bo *mBuffer;
       public:
-        gbm_bo *get() { return mBuffer; }
+        gbm_bo *get() const { return mBuffer; }
 
         Handle(gbm_surface *surface, gbm_bo *buffer)
           : mSurface{surface}, mBuffer{buffer}
@@ -427,11 +431,12 @@ namespace {
             delete static_cast<drm::FrameBuffer *>(framebuffer);
           }
         );
+        return framebuffer;
       }
     };
 
     // This abstracts a swapchain.
-    class Surface {
+    class Surface final {
     private:
       // I'm not sure what guarantees we have -- better safe than sorry
       static void safe_delete(gbm_surface *surface) {
@@ -459,11 +464,296 @@ namespace {
 
       explicit operator bool() const { return mHandle != nullptr; }
 
+      gbm_surface *get() const {
+        assert(*this);
+        return mHandle.get();
+      }
+
       FrontBuffer lock_front_buffer() {
         assert(*this);
         return FrontBuffer::create(*mHandle);
       }
     };
+  }
+
+  namespace egl {
+    class Display final {
+    private:
+      EGLDisplay mDisplay;
+      Display(EGLDisplay display) : mDisplay{display} {}
+    public:
+      Display() : mDisplay{EGL_NO_DISPLAY} {}
+      Display(Display const &) = delete;
+      Display &operator=(Display const &) = delete;
+      Display(Display &&other) noexcept : mDisplay{other.mDisplay} {
+        other.mDisplay = EGL_NO_DISPLAY;
+      }
+      Display &operator=(Display &&other) noexcept {
+        if (this == &other) return *this;
+        this->~Display();
+        new (this) Display{std::move(other)};
+        return *this;
+      }
+      ~Display() {
+        if (mDisplay != EGL_NO_DISPLAY) eglTerminate(mDisplay);
+      }
+
+      explicit operator bool() const { return mDisplay != EGL_NO_DISPLAY; }
+
+      EGLDisplay get() const {
+        assert(*this);
+        return mDisplay;
+      }
+
+      static Display create(gbm::Device const &gbm) {
+        auto get_platform_display = reinterpret_cast<
+          PFNEGLGETPLATFORMDISPLAYEXTPROC
+        >(
+          eglGetProcAddress("eglGetPlatformDisplayEXT")
+        );
+        if (get_platform_display == nullptr) {
+          std::cerr << "Couldn't find eglGetPlatformDisplay" << std::endl;
+          return {};
+        }
+        EGLDisplay display = get_platform_display(
+          EGL_PLATFORM_GBM_KHR, gbm.get(), nullptr
+        );
+        if (display == EGL_NO_DISPLAY) {
+          std::cerr << "Couldn't find EGL display" << std::endl;
+          return {};
+        }
+
+        EGLint major, minor;
+        EGLBoolean success = eglInitialize(display, &major, &minor); 
+        if (!success) {
+          std::cerr << "Couldn't initialize EGL" << std::endl;
+          return {};
+        }
+
+        std::cout << "EGL Version: " << eglQueryString(display, EGL_VERSION)
+          << std::endl
+        ;
+        std::cout << "EGL Vendor: " << eglQueryString(display, EGL_VENDOR)
+          << std::endl
+        ;
+        std::cout << "EGL Extensions: "
+          << eglQueryString(display, EGL_EXTENSIONS) << std::endl
+        ;
+
+        success = eglBindAPI(EGL_OPENGL_ES_API);
+        if (!success) {
+          std::cerr << "Couldn't use OpenGL ES 3" << std::endl;
+          return {};
+        }
+
+        return {display};
+      }
+    };
+
+    EGLConfig make_config(Display const &display) {
+      static constexpr EGLint config_attributes[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT
+      , EGL_RED_SIZE, 1
+      , EGL_GREEN_SIZE, 1
+      , EGL_BLUE_SIZE, 1
+      , EGL_ALPHA_SIZE, 0
+      , EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT
+      , EGL_NONE
+      };
+
+      EGLConfig config;
+      EGLint num_processed;
+      EGLBoolean success = eglChooseConfig(
+        display.get(), config_attributes, &config, 1, &num_processed
+      );
+      if (!success || num_processed != 1 || config == nullptr) {
+        std::cerr << "eglChooseConfig failed" << std::endl;
+        return nullptr;
+      }
+      return config;
+    }
+
+    class Context final {
+    private:
+      EGLDisplay mDisplay;
+      EGLContext mContext;
+      EGLConfig mConfig;
+      Context(EGLDisplay display, EGLContext context, EGLConfig config)
+        : mDisplay{display}, mContext{context}, mConfig{config}
+      {}
+    public:
+      Context() : mDisplay{}, mContext{EGL_NO_CONTEXT}, mConfig{nullptr} {}
+      Context(Context const &) = delete;
+      Context &operator=(Context const &) = delete;
+      Context(Context &&other) noexcept
+        : mDisplay{other.mDisplay}
+        , mContext{other.mContext}
+      {
+        other.mDisplay = EGL_NO_DISPLAY;
+        other.mContext = EGL_NO_CONTEXT;
+      }
+      Context &operator=(Context &&other) noexcept {
+        if (this == &other) return *this;
+        this->~Context();
+        new (this) Context{std::move(other)};
+        return *this;
+      }
+      ~Context() {
+        if (mContext != EGL_NO_CONTEXT) eglDestroyContext(mDisplay, mContext);
+      }
+
+      explicit operator bool() const {
+        return mDisplay != EGL_NO_DISPLAY && mContext != EGL_NO_CONTEXT
+            && mConfig != nullptr
+        ;
+      }
+
+      EGLContext get() const { assert(*this); return mContext; }
+      EGLConfig config() const { assert(*this); return mConfig; }
+
+      // Keeps a reference to the display!
+      static Context create(
+        Display const &display, EGLConfig config
+      , Context const *shared_context = nullptr
+      ) {
+        assert(config != nullptr);
+        static constexpr EGLint attributes[] = {
+          EGL_CONTEXT_CLIENT_VERSION, 3
+        , EGL_NONE
+        };
+        EGLContext share = EGL_NO_CONTEXT;
+        if (shared_context != nullptr) {
+          share = shared_context->mContext;
+        }
+        EGLContext context = eglCreateContext(
+          display.get(), config, share, attributes
+        );
+        if (context == EGL_NO_CONTEXT) {
+          std::cerr << "Failed to create OpenGL context" << std::endl;
+          return {};
+        }
+
+        return {display.get(), context,config};
+      }
+    };
+
+    class Surface final {
+    private:
+      EGLDisplay mDisplay;
+      EGLSurface mSurface;
+      Surface(EGLDisplay display, EGLSurface surface)
+        : mDisplay{display}, mSurface{surface}
+      {}
+    public:
+      Surface() : mDisplay{EGL_NO_DISPLAY}, mSurface{EGL_NO_SURFACE} {}
+      Surface(Surface const &) = delete;
+      Surface &operator=(Surface const &) = delete;
+      Surface(Surface &&other)
+        : mDisplay{other.mDisplay}, mSurface{other.mSurface}
+      { other.mDisplay = EGL_NO_DISPLAY; other.mSurface = EGL_NO_SURFACE; }
+      Surface &operator=(Surface &&other) {
+        if (this == &other) return *this;
+        this->~Surface();
+        new (this) Surface{std::move(other)};
+        return *this;
+      }
+      ~Surface() { if (*this) eglDestroySurface(mDisplay, mSurface); }
+
+      explicit operator bool() const {
+        return mDisplay != EGL_NO_DISPLAY && mSurface != EGL_NO_SURFACE;
+      }
+
+      EGLSurface get() const { assert(*this); return mSurface; }
+
+      static Surface create(
+        Display const &display, EGLConfig config
+      , gbm::Surface const &gbm_surface
+      ) {
+        assert(config != nullptr);
+        EGLSurface surface = eglCreateWindowSurface(
+          display.get(), config, gbm_surface.get(), nullptr
+        );
+        if (surface == EGL_NO_SURFACE) {
+          std::cerr << "Failed to create EGL surface" << std::endl;
+          return {};
+        } else {
+          return {display.get(), surface};
+        }
+      }
+    };
+
+    class CurrentContext final {
+    private:
+      EGLDisplay mDisplay;
+      CurrentContext(EGLDisplay display) : mDisplay{display} {}
+    public:
+      CurrentContext() : mDisplay{EGL_NO_DISPLAY} {}
+      CurrentContext(CurrentContext const &) = delete;
+      CurrentContext &operator=(CurrentContext const &) = delete;
+      CurrentContext(CurrentContext &&other)
+        : mDisplay{other.mDisplay}
+      { other.mDisplay = EGL_NO_DISPLAY; }
+      CurrentContext &operator=(CurrentContext &&other) {
+        if (this == &other) return *this;
+        this->~CurrentContext();
+        new (this) CurrentContext{std::move(other)};
+        return *this;
+      }
+      ~CurrentContext() {
+        if (*this) eglMakeCurrent(
+          mDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT
+        );
+      }
+
+      explicit operator bool() const { return mDisplay != nullptr; }
+
+      static CurrentContext create(
+        Display const &display, Surface const &surface, Context const &context
+      ) {
+        EGLBoolean success = eglMakeCurrent(
+          display.get(), surface.get(), surface.get(), context.get()
+        );
+        if (!success) {
+          std::cerr << "Failed to make context current" << std::endl;
+          return {};
+        }
+        return {display.get()};
+      }
+    };
+
+    class ThreadContext {
+    private:
+      // Mimic what OpenGL does
+      static thread_local CurrentContext sCurrentContext;
+
+    public:
+      static Context make_current(
+        gbm::Device const &gbm, gbm::Surface const &gbm_surface
+      , Context const *share_context = nullptr
+      ) {
+        auto display = Display::create(gbm);
+        if (!display) return {};
+
+        EGLConfig config = make_config(display);
+        if (config == nullptr) return {};
+
+        auto context = Context::create(display, config, share_context);
+        if (!context) return {};
+
+        auto surface = Surface::create(display, config, gbm_surface);
+        if (!surface) return {};
+
+        sCurrentContext = CurrentContext::create(display, surface, context);
+        if (!sCurrentContext) return {};
+
+        return context;
+      }
+
+      static bool is_set() {
+        return static_cast<bool>(sCurrentContext);
+      }
+    };
+    thread_local CurrentContext ThreadContext::sCurrentContext{};
   }
 
   class Display {
@@ -496,6 +786,7 @@ namespace {
       if (!framebuffer) return false;
       if (drm::set_mode(gpu, *framebuffer, mConnectorID, mCrtcID, mMode)) {
         mCurrentFrontBuffer = std::move(front);
+        return true;
       } else {
         return false;
       }
