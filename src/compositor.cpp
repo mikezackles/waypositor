@@ -1,9 +1,14 @@
+#include <atomic>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <thread>
+
+#include <boost/asio/io_service.hpp>
+#include <boost/asio/read.hpp>
+#include <boost/asio/posix/stream_descriptor.hpp>
 
 #include <cassert>
 #include <cstdlib>
@@ -297,20 +302,25 @@ namespace {
       }
     }
 
+    struct FlipData {
+      std::atomic<uint32_t> crtc_id;
+      bool flip_is_pending;
+    };
+
     // Holds a reference to page_flip_pending
     bool begin_page_flip(
       Descriptor const &gpu, FrameBuffer const &framebuffer
-    , uint32_t crtc_id, bool &page_flip_pending
+    , uint32_t crtc_id, FlipData &flip_data
     ) {
       int error = drmModePageFlip(
         gpu.get(), crtc_id, framebuffer.get()
-      , DRM_MODE_PAGE_FLIP_EVENT, &page_flip_pending
+      , DRM_MODE_PAGE_FLIP_EVENT, &flip_data
       );
       if (error) {
         perror("Page flip failed");
         return false;
       } else {
-        page_flip_pending = true;
+        flip_data.flip_is_pending = true;
         return true;
       }
     }
@@ -321,15 +331,19 @@ namespace {
       , unsigned int /*frame*/
       , unsigned int /*seconds*/
       , unsigned int /*microseconds*/
+      , unsigned int crtc_id
       , void *user_data
       ) {
-        bool *flip_is_pending = static_cast<bool *>(user_data);
-        *flip_is_pending = false;
+        auto flip_data = static_cast<FlipData *>(user_data);
+        assert(flip_data != nullptr);
+        if (crtc_id == flip_data->crtc_id) {
+          flip_data->flip_is_pending = false;
+        }
       }
       drmEventContext make_event_context() {
         drmEventContext context;
         context.version = 3;
-        context.page_flip_handler = &mark_flip_no_longer_pending;
+        context.page_flip_handler2 = &mark_flip_no_longer_pending;
         return context;
       }
     }
@@ -859,55 +873,51 @@ namespace {
   // Instances of this class contain implicit global, thread-local state due
   // to the nature of the EGL/OpenGL APIs. It should not be moved across
   // thread boundaries.
-  class Display {
+  class ActiveDisplay {
   private:
     std::thread::id mThreadID;
     gbm::Surface mSurface;
     egl::DrawableContext mEGL;
-    uint32_t mCrtcID;
+    drm::FlipData mFlipData;
     gbm::FrontBuffer mCurrentFrontBuffer;
     gbm::FrontBuffer mNextFrontBuffer;
-    bool mWaitingForPageFlip;
 
-    Display(
+  public:
+    // Ideally this shouldn't be exposed, but make_optional needs to call the
+    // constructor
+    ActiveDisplay(
       gbm::Surface gbm_surface
     , egl::DrawableContext context
     , uint32_t crtc_id
     ) : mThreadID{std::this_thread::get_id()}
       , mSurface{std::move(gbm_surface)}
       , mEGL{std::move(context)}
-      , mCrtcID{crtc_id}
+      , mFlipData{crtc_id, false}
       , mCurrentFrontBuffer{}, mNextFrontBuffer{}
-      , mWaitingForPageFlip{false}
     {}
 
-    Display() : Display{{}, {}, 0} {}
-  public:
-    static Display create(
+    static std::optional<ActiveDisplay> create(
       gbm::Device const &gbm, egl::Display const &egl
-    , egl::SurfacelessContext const &master_context
     , uint32_t width, uint32_t height
     , uint32_t crtc_id // TODO - needed?
     ) {
       gbm::Surface gbm_surface{gbm, width, height};
-      if (!gbm_surface) return {};
+      if (!gbm_surface) return std::nullopt;
 
-      egl::DrawableContext context = master_context.create_child_context(
-        egl, gbm_surface
+      auto context = egl::DrawableContext::create(egl, gbm_surface);
+      if (!context) return std::nullopt;
+
+      return std::make_optional<ActiveDisplay>(
+        std::move(gbm_surface), std::move(context), crtc_id
       );
-      if (!context) return {};
-
-      return {std::move(gbm_surface), std::move(context), crtc_id};
     }
 
     explicit operator bool() const {
-      return static_cast<bool>(mSurface)
-          // Prevent using this on a thread other than the one it was created on
-          && std::this_thread::get_id() == mThreadID;
-      ;
+      // Prevent using this on a thread other than the one it was created on
+      return (std::this_thread::get_id() == mThreadID) && mSurface && mEGL;
     }
 
-    uint32_t crtc_id() const { assert(*this); return mCrtcID; }
+    uint32_t crtc_id() const { assert(*this); return mFlipData.crtc_id; }
 
     bool set_mode(
       drm::Descriptor const &gpu
@@ -923,7 +933,9 @@ namespace {
       if (!front) return false;
       auto framebuffer = front.ensure_framebuffer(gpu);
       if (!framebuffer) return false;
-      if (drm::set_mode(gpu, *framebuffer, connector_id, mCrtcID, mode)) {
+      if (drm::set_mode(
+        gpu, *framebuffer, connector_id, mFlipData.crtc_id, mode
+      )) {
         mCurrentFrontBuffer = std::move(front);
         return true;
       } else {
@@ -942,7 +954,7 @@ namespace {
       auto framebuffer = front.ensure_framebuffer(gpu);
       if (!framebuffer) return false;
       bool success = drm::begin_page_flip(
-        gpu, *framebuffer, mCrtcID, mWaitingForPageFlip
+        gpu, *framebuffer, mFlipData.crtc_id, mFlipData
       );
       if (success) mNextFrontBuffer = std::move(front);
       return success;
@@ -950,19 +962,158 @@ namespace {
 
     bool buffer_swap_is_pending() const {
       assert(*this);
-      return mWaitingForPageFlip;
+      return mFlipData.flip_is_pending;
     }
 
     bool handle_event(drm::Descriptor const &gpu) {
-      assert(*this);
-      assert(mWaitingForPageFlip);
+      assert(*this && mFlipData.flip_is_pending);
       return drm::handle_event(gpu);
     }
 
     void finish_swap_buffers() {
-      assert(*this);
-      assert(!mWaitingForPageFlip);
+      assert(*this && !mFlipData.flip_is_pending);
       mCurrentFrontBuffer = std::move(mNextFrontBuffer);
+    }
+  };
+
+  namespace asio = boost::asio;
+
+  template <typename DrawCallback>
+  class DrawRoutine {
+  private:
+    enum class State { MODE_SET, DRAWING, STOPPED };
+    std::atomic<bool> const &mKeepRunning;
+    asio::io_service &mASIO;
+    drm::Descriptor const&mDRM;
+    uint32_t mConnectorID;
+    drmModeModeInfo &mMode;
+    egl::Display const &mEGL;
+    asio::posix::stream_descriptor mDescriptor;
+    std::optional<ActiveDisplay> mDisplay;
+    DrawCallback mDrawCallback;
+    State mState;
+
+    DrawRoutine(
+      std::atomic<bool> const &keep_running
+    , asio::io_service &asio
+    , drm::Descriptor const &drm
+    , gbm::Device const &gbm
+    , egl::Display const &egl
+    , uint32_t connector_id
+    , uint32_t crtc_id
+    , drmModeModeInfo &mode
+    , DrawCallback draw_callback
+    ) : mKeepRunning{keep_running}
+      , mASIO{asio}
+      , mDRM{drm}
+      , mConnectorID{connector_id}
+      , mMode{mode}
+      , mEGL{egl}
+      , mDescriptor{asio, drm.get()}
+      , mDisplay{ActiveDisplay::create(
+          gbm, egl, mode.hdisplay, mode.vdisplay, crtc_id
+        )}
+      , mDrawCallback{std::move(draw_callback)}
+      , mState{State::MODE_SET}
+    {}
+
+    class Worker final {
+    private:
+      DrawRoutine *self;
+    public:
+      Worker(DrawRoutine &state) : self{&state} {}
+
+      Worker(Worker const &) = delete;
+      Worker &operator=(Worker const &) = delete;
+      Worker(Worker &&other) noexcept : self{other.self} {
+        other.self = nullptr;
+      }
+      Worker &operator=(Worker &&other) {
+        self = other.self;
+        other.self = nullptr;
+      }
+      ~Worker() = default;
+
+      explicit operator bool() const { return self != nullptr; }
+      void operator()(std::error_code error = {}, std::size_t = 0) {
+        assert(*self);
+
+        if (error) {
+          std::cerr << "ASIO error: " << error.message() << std::endl;
+          std::cerr << "Thread exiting due to error" << std::endl;
+          return;
+        }
+
+        if (!self->mKeepRunning) {
+          std::cout << "Thread exiting due to external request" << std::endl;
+          return;
+        }
+
+        switch (self->mState) {
+        case State::MODE_SET:
+          if (!self->mDisplay->set_mode(
+            self->mDRM, self->mEGL, self->mConnectorID, self->mMode
+          )) {
+            std::cerr << "Thread exiting due to error" << std::endl;
+            return;
+          }
+          self->mState = State::DRAWING;
+          self->mASIO.post(std::move(*this));
+          return;
+        case State::DRAWING:
+          // Do the drawing
+          self->mDrawCallback();
+
+          // Begin the flip
+          if (!self->mDisplay->begin_swap_buffers(self->mDRM, self->mEGL)) {
+            std::cerr << "Thread exiting due to error" << std::endl;
+            return;
+          }
+          // Wait for the flip
+          self->mState = State::PAGE_FLIP;
+          asio::async_read(
+            self->mDescriptor, asio::null_buffers(), std::move(*this)
+          );
+          return;
+        case State::PAGE_FLIP:
+          self->mDisplay->handle_event(self->mDRM);
+          if (self->mDisplay->buffer_swap_is_pending()) {
+            // Keep waiting
+            asio::async_read(
+              self->mDescriptor, asio::null_buffers(), std::move(*this)
+            );
+            return;
+          } else {
+            // Complete the flip
+            self->mDisplay->finish_swap_buffers();
+
+            // Draw the next frame
+            self->mState = State::DRAWING;
+            self->mASIO.post(std::move(*this));
+            return;
+          }
+        }
+      }
+    };
+
+  public:
+    explicit operator bool() const { return mDisplay; }
+
+    static bool begin(
+      std::atomic<bool> const &keep_running
+    , asio::io_service &asio
+    , drm::Descriptor const &drm
+    , gbm::Device const &gbm
+    , egl::Display const &egl
+    , uint32_t width, uint32_t height, uint32_t crtc_id
+    ) {
+      auto display = ActiveDisplay::create(gbm, egl, width, height, crtc_id);
+      DrawRoutine state{
+        keep_running, asio, drm, gbm, egl, width, height, crtc_id
+      };
+      if (!state) return false;
+      Worker{state}();
+      return true;
     }
   };
 
@@ -971,10 +1122,9 @@ namespace {
     drm::Descriptor mGPUDescriptor;
     gbm::Device mGBM;
     egl::Display mEGL;
-    egl::SurfacelessContext mMasterContext;
     // The keys here are connector ids returned from libdrm. The hope is that
     // they are consistent across reboots etc.
-    std::map<uint32_t, Display> mDisplayLookup;
+    std::map<uint32_t, ActiveDisplay> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
     std::optional<uint32_t> find_crtc_for_connector(
@@ -995,12 +1145,10 @@ namespace {
 
     DeviceManager(
       drm::Descriptor gpu, gbm::Device gbm, egl::Display egl
-    , egl::SurfacelessContext master
     , std::set<uint32_t> unused_crtcs
     ) : mGPUDescriptor{std::move(gpu)}
       , mGBM{std::move(gbm)}
       , mEGL{std::move(egl)}
-      , mMasterContext{std::move(master)}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
     {}
@@ -1019,61 +1167,58 @@ namespace {
       auto egl = egl::Display::create(gbm);
       if (!egl) return std::nullopt;
 
-      auto master = egl::SurfacelessContext::create(egl);
-      if (!master) return std::nullopt;
-
       std::set<uint32_t> unused_crtcs{};
       for (uint32_t crtc_id : resources.crtcs()) unused_crtcs.insert(crtc_id);
 
       std::optional<DeviceManager> result{{
-        std::move(*gpu), std::move(gbm), std::move(egl)
-      , std::move(master), std::move(unused_crtcs)
+        std::move(*gpu), std::move(gbm), std::move(egl), std::move(unused_crtcs)
       }};
       if (!*result) return std::nullopt;
 
       return result;
     }
 
-    explicit operator bool() const { return static_cast<bool>(mGPUDescriptor); }
+    explicit operator bool() const {
+      return mGPUDescriptor && mGBM && mEGL;
+    }
 
     void update_connections() {
-      assert(*this);
+      //assert(*this);
 
-      drm::Resources resources{mGPUDescriptor};
-      if (!resources) return;
+      //drm::Resources resources{mGPUDescriptor};
+      //if (!resources) return;
 
-      for (uint32_t connector_id : resources.connectors()) {
-        drm::Connector connector{mGPUDescriptor, connector_id};
-        if (!connector) continue;
+      //for (uint32_t connector_id : resources.connectors()) {
+      //  drm::Connector connector{mGPUDescriptor, connector_id};
+      //  if (!connector) continue;
 
-        if (
-          auto it = mDisplayLookup.find(connector.id());
-          it != mDisplayLookup.end()
-        ) {
-          if (!connector.is_connected()) {
-            // Someone unplugged it!
-            mUnusedCrtcs.insert(it->second.crtc_id());
-            mDisplayLookup.erase(it);
-          }
-        } else if (connector.is_connected()) {
-          // Someone plugged it in!
-          drmModeModeInfo *mode = connector.find_best_mode();
-          if (!mode) continue;
+      //  if (
+      //    auto it = mDisplayLookup.find(connector.id());
+      //    it != mDisplayLookup.end()
+      //  ) {
+      //    if (!connector.is_connected()) {
+      //      // Someone unplugged it!
+      //      mUnusedCrtcs.insert(it->second.crtc_id());
+      //      mDisplayLookup.erase(it);
+      //    }
+      //  } else if (connector.is_connected()) {
+      //    // Someone plugged it in!
+      //    drmModeModeInfo *mode = connector.find_best_mode();
+      //    if (!mode) continue;
 
-          auto crtc_id = find_crtc_for_connector(resources, connector);
-          if (!crtc_id) continue;
+      //    auto crtc_id = find_crtc_for_connector(resources, connector);
+      //    if (!crtc_id) continue;
 
-          auto display = Display::create(
-            mGBM, mEGL, mMasterContext, mode->hdisplay, mode->vdisplay
-          , *crtc_id
-          );
-          if (!display) continue;
+      //    auto display = ActiveDisplay::create(
+      //      mGBM, mEGL, mode->hdisplay, mode->vdisplay, *crtc_id
+      //    );
+      //    if (!display) continue;
 
-          // This isn't working code yet. We need a thread per display.
-          mDisplayLookup.emplace(connector.id(), std::move(display));
-          mUnusedCrtcs.erase(*crtc_id);
-        }
-      }
+      //    // This isn't working code yet. We need a thread per display.
+      //    mDisplayLookup.emplace(connector.id(), std::move(display));
+      //    mUnusedCrtcs.erase(*crtc_id);
+      //  }
+      //}
     }
   };
 }
