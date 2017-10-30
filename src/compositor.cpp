@@ -39,6 +39,7 @@ namespace {
   private:
     int mHandle;
   public:
+    FileDescriptor() : mHandle{-1} {}
     FileDescriptor(char const *path)
       : mHandle{open(path, O_RDWR)}
     {
@@ -96,17 +97,18 @@ namespace {
       FileDescriptor mFile;
       Descriptor(FileDescriptor file) : mFile{std::move(file)} {}
     public:
-      static std::optional<Descriptor> create(char const *path) {
+      Descriptor() = default;
+      static Descriptor create(char const *path) {
         FileDescriptor file{path};
-        if (!file) return std::nullopt;
+        if (!file) return {};
 
         int error = drmSetMaster(file.get());
         if (error) {
           perror("Couldn't become drm master!");
-          return std::nullopt;
+          return {};
         }
 
-        return Descriptor{std::move(file)};
+        return {std::move(file)};
       }
       Descriptor(Descriptor const &) = delete;
       Descriptor &operator=(Descriptor const &) = delete;
@@ -883,8 +885,6 @@ namespace {
     gbm::FrontBuffer mNextFrontBuffer;
 
   public:
-    // Ideally this shouldn't be exposed, but make_optional needs to call the
-    // constructor
     ActiveDisplay(
       gbm::Surface gbm_surface
     , egl::DrawableContext context
@@ -1154,28 +1154,27 @@ namespace {
     {}
 
   public:
-    static std::optional<DeviceManager> create(char const *path) {
+    DeviceManager() : DeviceManager({}, {}, {}, {}) {}
+
+    static DeviceManager create(char const *path) {
       auto gpu = drm::Descriptor::create(path);
-      if (!gpu) return std::nullopt;
+      if (!gpu) return {};
 
-      drm::Resources resources{*gpu};
-      if (!resources) return std::nullopt;
+      drm::Resources resources{gpu};
+      if (!resources) return {};
 
-      gbm::Device gbm{*gpu};
-      if (!gbm) return std::nullopt;
+      gbm::Device gbm{gpu};
+      if (!gbm) return {};
 
       auto egl = egl::Display::create(gbm);
-      if (!egl) return std::nullopt;
+      if (!egl) return {};
 
       std::set<uint32_t> unused_crtcs{};
       for (uint32_t crtc_id : resources.crtcs()) unused_crtcs.insert(crtc_id);
 
-      std::optional<DeviceManager> result{{
-        std::move(*gpu), std::move(gbm), std::move(egl), std::move(unused_crtcs)
-      }};
-      if (!*result) return std::nullopt;
-
-      return result;
+      return {
+        std::move(gpu), std::move(gbm), std::move(egl), std::move(unused_crtcs)
+      };
     }
 
     explicit operator bool() const {
@@ -1226,6 +1225,6 @@ namespace {
 int main() {
   auto drm = DeviceManager::create("/dev/dri/card0");
   if (!drm) return EXIT_FAILURE;
-  drm->update_connections();
+  drm.update_connections();
   return EXIT_SUCCESS;
 }
