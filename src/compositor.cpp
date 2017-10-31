@@ -233,6 +233,11 @@ namespace {
         assert(*this);
         return {mHandle->crtcs, mHandle->count_crtcs};
       }
+
+      Span<uint32_t> const encoders() const {
+        assert(*this);
+        return {mHandle->encoders, mHandle->count_encoders};
+      }
     };
 
     class FrameBuffer final {
@@ -1190,11 +1195,12 @@ namespace {
         if (!encoder) continue;
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
-          bool unused = mUnusedCrtcs.find(crtc_id) == mUnusedCrtcs.end();
+          bool unused = mUnusedCrtcs.find(crtc_id) != mUnusedCrtcs.end();
           if (encoder.has_crtc(i) && unused) return crtc_id;
           ++i;
         }
       }
+      std::cerr << "No crtc found" << std::endl;
       return std::nullopt;
     }
 
@@ -1263,7 +1269,11 @@ namespace {
           auto crtc_id = find_crtc_for_connector(resources, connector);
           if (!crtc_id) continue;
 
-          // This isn't working code yet. We need a thread per display.
+          std::cout << "Found display " << *crtc_id
+                    << " at " << mode->hdisplay << "x" << mode->vdisplay
+                    << std::endl
+          ;
+
           mDisplayLookup.emplace(
             std::piecewise_construct
           , std::forward_as_tuple(connector.id())
