@@ -846,29 +846,6 @@ namespace {
         assert(*this);
         return DrawableContext::create(display, gbm_surface, &mContext);
       }
-
-      //class RAIIThread {
-      //private:
-      //  std::thread mThread;
-      //public:
-      //  RAIIThread() = default;
-      //  template <typename ...Args>
-      //  RAIIThread(Args&&... args) : mThread{std::forward<Args>(args)...} {}
-      //  RAIIThread(RAIIThread const &) = delete;
-      //  RAIIThread &operator=(RAIIThread const &) = delete;
-      //  RAIIThread(RAIIThread &&) = default;
-      //  RAIIThread &operator=(RAIIThread &&) = default;
-      //  ~RAIIThread() { if (mThread.joinable()) mThread.join(); }
-
-      //  explicit operator bool() const { return mThread.joinable(); }
-      //};
-
-      //template <typename Callback>
-      //RAIIThread spawn_child_thread(Callback callback) {
-      //  return [callback = std::move(callback)]() {
-      //    callback();
-      //  };
-      //}
     };
   }
 
@@ -979,9 +956,9 @@ namespace {
   namespace asio = boost::asio;
 
   template <typename DrawCallback>
-  class DrawRoutine {
+  class DrawRoutine final {
   private:
-    enum class State { MODE_SET, DRAWING, STOPPED };
+    enum class State { MODE_SET, DRAWING, PAGE_FLIP, STOPPED };
     std::atomic<bool> const &mKeepRunning;
     asio::io_service &mASIO;
     drm::Descriptor const&mDRM;
@@ -1023,8 +1000,12 @@ namespace {
     public:
       Worker(DrawRoutine &state) : self{&state} {}
 
-      Worker(Worker const &) = delete;
-      Worker &operator=(Worker const &) = delete;
+      // Declare but don't define copy semantics. We're using the boost copy of
+      // asio for now for convenience, but it doesn't want to accept move-only
+      // handlers. This trick outsmarts its checks (see
+      // https://stackoverflow.com/questions/17211263/how-to-trick-boostasio-to-allow-move-only-handlers)
+      Worker(Worker const &);
+      Worker &operator=(Worker const &);
       Worker(Worker &&other) noexcept : self{other.self} {
         other.self = nullptr;
       }
@@ -1035,7 +1016,7 @@ namespace {
       ~Worker() = default;
 
       explicit operator bool() const { return self != nullptr; }
-      void operator()(std::error_code error = {}, std::size_t = 0) {
+      void operator()(boost::system::error_code error = {}, std::size_t = 0) {
         assert(*self);
 
         if (error) {
@@ -1046,10 +1027,13 @@ namespace {
 
         if (!self->mKeepRunning) {
           std::cout << "Thread exiting due to external request" << std::endl;
+          self->mState = State::STOPPED;
           return;
         }
 
         switch (self->mState) {
+        case State::STOPPED:
+          assert(false);
         case State::MODE_SET:
           if (!self->mDisplay->set_mode(
             self->mDRM, self->mEGL, self->mConnectorID, self->mMode
@@ -1097,7 +1081,7 @@ namespace {
     };
 
   public:
-    explicit operator bool() const { return mDisplay; }
+    explicit operator bool() const { return static_cast<bool>(mDisplay); }
 
     static bool begin(
       std::atomic<bool> const &keep_running
@@ -1105,11 +1089,17 @@ namespace {
     , drm::Descriptor const &drm
     , gbm::Device const &gbm
     , egl::Display const &egl
-    , uint32_t width, uint32_t height, uint32_t crtc_id
+    , uint32_t connector_id
+    , uint32_t crtc_id
+    , drmModeModeInfo &mode
+    , DrawCallback draw_callback
     ) {
-      auto display = ActiveDisplay::create(gbm, egl, width, height, crtc_id);
+      auto display = ActiveDisplay::create(
+        gbm, egl, mode.hdisplay, mode.vdisplay, crtc_id
+      );
       DrawRoutine state{
-        keep_running, asio, drm, gbm, egl, width, height, crtc_id
+        keep_running, asio, drm, gbm, egl, connector_id, crtc_id, mode
+      , std::move(draw_callback)
       };
       if (!state) return false;
       Worker{state}();
@@ -1117,21 +1107,86 @@ namespace {
     }
   };
 
-  class DeviceManager {
+  class RAIIThread {
   private:
-    drm::Descriptor mGPUDescriptor;
+    std::thread mThread;
+  public:
+    RAIIThread() = default;
+    template <typename ...Args>
+    RAIIThread(Args&&... args) : mThread{std::forward<Args>(args)...} {}
+    RAIIThread(RAIIThread const &) = delete;
+    RAIIThread &operator=(RAIIThread const &) = delete;
+    RAIIThread(RAIIThread &&) = default;
+    RAIIThread &operator=(RAIIThread &&) = default;
+    ~RAIIThread() { if (mThread.joinable()) mThread.join(); }
+
+    explicit operator bool() const { return mThread.joinable(); }
+  };
+
+  class DrawThread final {
+  private:
+    std::atomic<bool> mKeepRunning;
+    asio::io_service mASIO;
+    uint32_t mCrtcID;
+    RAIIThread mThread;
+  public:
+    // Run something on the drawing thread
+    template <typename Callback>
+    void post(Callback &&callback) {
+      mASIO.post(std::forward<Callback>(callback));
+    }
+
+    uint32_t crtc_id() const { return mCrtcID; }
+
+    void stop() { mKeepRunning = false; }
+
+    explicit operator bool() const { return static_cast<bool>(mThread); }
+
+    template <typename DrawCallback>
+    DrawThread(
+      drm::Descriptor const &drm
+    , gbm::Device const &gbm
+    , egl::Display const &egl
+    , uint32_t connector_id
+    , uint32_t crtc_id
+    , drmModeModeInfo &mode
+    , DrawCallback draw_callback
+    ) : mKeepRunning{false}
+      , mASIO{}
+      , mCrtcID{crtc_id}
+      , mThread{[
+          this, &drm, &gbm, &egl
+        , connector_id, crtc_id, &mode
+        , draw_callback = std::move(draw_callback)
+        ]() {
+          if (DrawRoutine<DrawCallback>::begin(
+            mKeepRunning
+          , mASIO
+          , drm, gbm, egl
+          , connector_id, crtc_id, mode
+          , std::move(draw_callback)
+          )) {
+            mASIO.run();
+          }
+        }}
+    {}
+  };
+
+  class DeviceManager final {
+  private:
+    drm::Descriptor mDRM;
     gbm::Device mGBM;
     egl::Display mEGL;
     // The keys here are connector ids returned from libdrm. The hope is that
     // they are consistent across reboots etc.
-    std::map<uint32_t, ActiveDisplay> mDisplayLookup;
+    std::map<uint32_t, DrawThread> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
     std::optional<uint32_t> find_crtc_for_connector(
       drm::Resources const &resources, drm::Connector const &connector
     ) {
       for (uint32_t encoder_id : connector.encoders()) {
-        drm::Encoder encoder{mGPUDescriptor, encoder_id};
+        drm::Encoder encoder{mDRM, encoder_id};
         if (!encoder) continue;
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
@@ -1146,7 +1201,7 @@ namespace {
     DeviceManager(
       drm::Descriptor gpu, gbm::Device gbm, egl::Display egl
     , std::set<uint32_t> unused_crtcs
-    ) : mGPUDescriptor{std::move(gpu)}
+    ) : mDRM{std::move(gpu)}
       , mGBM{std::move(gbm)}
       , mEGL{std::move(egl)}
       , mDisplayLookup{}
@@ -1178,46 +1233,51 @@ namespace {
     }
 
     explicit operator bool() const {
-      return mGPUDescriptor && mGBM && mEGL;
+      return mDRM && mGBM && mEGL;
     }
 
     void update_connections() {
-      //assert(*this);
+      assert(*this);
 
-      //drm::Resources resources{mGPUDescriptor};
-      //if (!resources) return;
+      drm::Resources resources{mDRM};
+      if (!resources) return;
 
-      //for (uint32_t connector_id : resources.connectors()) {
-      //  drm::Connector connector{mGPUDescriptor, connector_id};
-      //  if (!connector) continue;
+      for (uint32_t connector_id : resources.connectors()) {
+        drm::Connector connector{mDRM, connector_id};
+        if (!connector) continue;
 
-      //  if (
-      //    auto it = mDisplayLookup.find(connector.id());
-      //    it != mDisplayLookup.end()
-      //  ) {
-      //    if (!connector.is_connected()) {
-      //      // Someone unplugged it!
-      //      mUnusedCrtcs.insert(it->second.crtc_id());
-      //      mDisplayLookup.erase(it);
-      //    }
-      //  } else if (connector.is_connected()) {
-      //    // Someone plugged it in!
-      //    drmModeModeInfo *mode = connector.find_best_mode();
-      //    if (!mode) continue;
+        if (
+          auto it = mDisplayLookup.find(connector.id());
+          it != mDisplayLookup.end()
+        ) {
+          if (!connector.is_connected()) {
+            // Someone unplugged it!
+            mUnusedCrtcs.insert(it->second.crtc_id());
+            mDisplayLookup.erase(it);
+          }
+        } else if (connector.is_connected()) {
+          // Someone plugged it in!
+          drmModeModeInfo *mode = connector.find_best_mode();
+          if (!mode) continue;
 
-      //    auto crtc_id = find_crtc_for_connector(resources, connector);
-      //    if (!crtc_id) continue;
+          auto crtc_id = find_crtc_for_connector(resources, connector);
+          if (!crtc_id) continue;
 
-      //    auto display = ActiveDisplay::create(
-      //      mGBM, mEGL, mode->hdisplay, mode->vdisplay, *crtc_id
-      //    );
-      //    if (!display) continue;
-
-      //    // This isn't working code yet. We need a thread per display.
-      //    mDisplayLookup.emplace(connector.id(), std::move(display));
-      //    mUnusedCrtcs.erase(*crtc_id);
-      //  }
-      //}
+          // This isn't working code yet. We need a thread per display.
+          mDisplayLookup.emplace(
+            std::piecewise_construct
+          , std::forward_as_tuple(connector.id())
+          , std::forward_as_tuple(
+              mDRM, mGBM, mEGL, connector.id(), *crtc_id, *mode
+            , []() {
+                glClearColor(0.5, 0.5, 0.5, 1.0);
+                glClear(GL_COLOR_BUFFER_BIT);
+              }
+            )
+          );
+          mUnusedCrtcs.erase(*crtc_id);
+        }
+      }
     }
   };
 }

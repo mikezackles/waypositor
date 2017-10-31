@@ -23,7 +23,9 @@ endforeach
 libdrm = dependency('libdrm', required : true)
 libgbm = dependency('gbm', required : true)
 libegl = dependency('egl', required : true)
+libgl = dependency('gl', required : true)
 boost = dependency('boost', modules : ['system'], required : true)
+threads = dependency('threads', required : false)
 
 executable(
   'ob-compositor'
@@ -31,7 +33,7 @@ executable(
 , install: true
 #, include_directories : include
 #, link_with : [liboblong_input]
-, dependencies : [libdrm, libgbm, libegl, boost]
+, dependencies : [libdrm, libgbm, libegl, libgl, boost, threads]
 , cpp_args : cpp_flags
 )
 
