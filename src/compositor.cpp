@@ -117,7 +117,7 @@ namespace {
       ~Descriptor() {
         if (!*this) return;
         int error = drmDropMaster(mFile.get());
-        if (error) perror("Error dropping drm master!");
+        if (error) std::cerr << "Error dropping drm master!" << std::endl;
       }
 
       explicit operator bool() const { return static_cast<bool>(mFile); }
@@ -168,7 +168,7 @@ namespace {
             drmModeGetConnector(gpu.get(), connector_id)
           , &safe_delete
           }
-      { if (!mHandle) perror("Couldn't get connector"); }
+      { if (!mHandle) std::cerr << "Couldn't get connector" << std::endl; }
 
       explicit operator bool() const { return mHandle != nullptr; }
 
@@ -385,7 +385,7 @@ namespace {
 
     class FrontBuffer final {
     private:
-      class Handle {
+      class Handle final {
       private:
         gbm_surface *mSurface;
         gbm_bo *mBuffer;
@@ -398,10 +398,21 @@ namespace {
         Handle() : Handle{nullptr, nullptr} {}
         Handle(Handle const &) = delete;
         Handle &operator=(Handle const &) = delete;
-        Handle(Handle &&) = default;
-        Handle &operator=(Handle &&) = default;
+        Handle(Handle &&other) noexcept
+          : mSurface{other.mSurface}, mBuffer{other.mBuffer}
+        {
+          other.mSurface = nullptr;
+          other.mBuffer = nullptr;
+        }
+        Handle &operator=(Handle &&other) noexcept {
+          // This class is final, and nothing here can throw exceptions.
+          if (this == &other) return *this;
+          this->~Handle();
+          new (this) Handle{std::move(other)};
+          return *this;
+        }
         ~Handle() {
-          gbm_surface_release_buffer(mSurface, mBuffer);
+          if (*this) gbm_surface_release_buffer(mSurface, mBuffer);
         }
 
         explicit operator bool() const {
@@ -1027,7 +1038,6 @@ namespace {
     }
   };
 
-  template <typename DrawCallback>
   class DrawRoutine final {
   private:
     enum class State { MODE_SET, DRAWING, PAGE_FLIP, STOPPED };
@@ -1038,7 +1048,7 @@ namespace {
     DisplayMode mMode;
     asio::posix::stream_descriptor mDescriptor;
     std::optional<ActiveDisplay> mDisplay;
-    DrawCallback mDrawCallback;
+    std::function<void()> mDrawCallback;
     State mState;
 
     DrawRoutine(
@@ -1048,7 +1058,7 @@ namespace {
     , gbm::Device const &gbm
     , egl::Display const &egl
     , DisplayMode mode
-    , DrawCallback draw_callback
+    , std::function<void()> draw_callback
     ) : mKeepRunning{keep_running}
       , mASIO{asio}
       , mDRM{drm}
@@ -1078,8 +1088,10 @@ namespace {
         other.self = nullptr;
       }
       Worker &operator=(Worker &&other) {
+        if (this == &other) return *this;
         self = other.self;
         other.self = nullptr;
+        return *this;
       }
       ~Worker() = default;
 
@@ -1150,7 +1162,9 @@ namespace {
     };
 
   public:
-    explicit operator bool() const { return static_cast<bool>(mDisplay); }
+    explicit operator bool() const {
+      return static_cast<bool>(mDisplay) && static_cast<bool>(*mDisplay);
+    }
 
     static void begin(
       std::atomic<bool> const &keep_running
@@ -1159,7 +1173,7 @@ namespace {
     , gbm::Device const &gbm
     , egl::Display const &egl
     , DisplayMode mode
-    , DrawCallback draw_callback
+    , std::function<void()> draw_callback
     ) {
       DrawRoutine state{
         keep_running, asio, drm, gbm, egl
@@ -1206,14 +1220,13 @@ namespace {
 
     explicit operator bool() const { return static_cast<bool>(mThread); }
 
-    template <typename DrawCallback>
     DrawThread(
       drm::Descriptor const &drm
     , gbm::Device const &gbm
     , egl::Display const &egl
     , DisplayMode mode
-    , DrawCallback draw_callback
-    ) : mKeepRunning{false}
+    , std::function<void()> draw_callback
+    ) : mKeepRunning{true}
       , mASIO{}
       , mCrtcID{mode.crtc_id()}
       , mThread{[
@@ -1221,7 +1234,7 @@ namespace {
         , mode = std::move(mode)
         , draw_callback = std::move(draw_callback)
         ]() mutable {
-          DrawRoutine<DrawCallback>::begin(
+          DrawRoutine::begin(
             mKeepRunning
           , mASIO
           , drm, gbm, egl
@@ -1307,6 +1320,10 @@ namespace {
           );
           if (!mode) continue;
 
+          float red = ((float) rand() / (RAND_MAX));
+          float green = ((float) rand() / (RAND_MAX));
+          float blue = ((float) rand() / (RAND_MAX));
+
           uint32_t connector_id = mode.connector_id();
           uint32_t crtc_id = mode.crtc_id();
           auto pair = mDisplayLookup.emplace(
@@ -1314,8 +1331,8 @@ namespace {
           , std::forward_as_tuple(connector_id)
           , std::forward_as_tuple(
               mDRM, mGBM, mEGL, std::move(mode)
-            , []() {
-                glClearColor(0.5, 0.5, 0.5, 1.0);
+            , [red, green, blue]() {
+                glClearColor(red, green, blue, 1.0);
                 glClear(GL_COLOR_BUFFER_BIT);
               }
             )
