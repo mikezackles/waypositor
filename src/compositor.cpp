@@ -1,7 +1,9 @@
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <thread>
@@ -9,6 +11,7 @@
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/signal_set.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 
 #include <cassert>
@@ -28,23 +31,101 @@
 #include <EGL/eglext.h>
 
 namespace {
-  template <typename Arg>
-  void perror(Arg&& message) {
-    static constexpr std::size_t errno_buffer_size = 256;
-    char buffer[errno_buffer_size];
-    strerror_r(errno, buffer, errno_buffer_size);
-    std::cerr << message << ": " << buffer << std::endl;
-  }
+  namespace asio = boost::asio;
+
+  class RAIIThread {
+  private:
+    std::thread mThread;
+  public:
+    RAIIThread() = default;
+    template <typename ...Args>
+    RAIIThread(Args&&... args) : mThread{std::forward<Args>(args)...} {}
+    RAIIThread(RAIIThread const &) = delete;
+    RAIIThread &operator=(RAIIThread const &) = delete;
+    RAIIThread(RAIIThread &&) = default;
+    RAIIThread &operator=(RAIIThread &&) = default;
+    ~RAIIThread() { if (*this) mThread.join(); }
+
+    explicit operator bool() const { return mThread.joinable(); }
+  };
+
+  class Logger final {
+  private:
+    asio::io_service mASIO;
+    std::optional<asio::io_service::work> mWork;
+    std::mutex mMutex;
+    RAIIThread mThread;
+
+    template <bool flush, typename Message, typename ...Messages>
+    static void print_helper(
+      std::ostream &ostream
+    , Message &&message, Messages&&... messages
+    ) {
+      ostream << message;
+      if constexpr (sizeof...(messages) > 0)
+        print_helper<flush>(ostream, messages...);
+      else if (flush)
+        ostream << std::endl;
+      else
+        ostream << "\n";
+    }
+
+  public:
+    Logger()
+      : mASIO{}
+      , mWork{mASIO}
+      , mMutex{}
+      , mThread{[this] { mASIO.run(); }}
+    {}
+
+    void stop() { mASIO.post([this] { mWork = std::nullopt; }); }
+
+    // This is immediate. It's slower, but it shouldn't be running under normal
+    // operation. Error messages won't be lost in the event of a crash.
+    template <typename ...Messages>
+    void error(Messages&&... messages) {
+      std::lock_guard lock{mMutex};
+      print_helper<true>(
+        std::cerr, "[", std::this_thread::get_id(), "] ", messages...
+      );
+    }
+
+    template <typename ...Messages>
+    void perror(Messages&&... messages) {
+      static constexpr std::size_t errno_buffer_size = 256;
+      char buffer[errno_buffer_size];
+      strerror_r(errno, buffer, errno_buffer_size);
+      this->error(messages..., ": ", buffer);
+    }
+
+    // This queues messages to run on the log thread.
+    template <typename ...Messages>
+    void info(Messages... messages) {
+      auto thread_id = std::this_thread::get_id();
+      mASIO.post([
+        this, thread_id = std::move(thread_id)
+      , messages = std::make_tuple(std::move(messages)...)
+      ]() {
+        std::apply(
+          [this, &thread_id](auto&&... messages_) {
+            std::lock_guard lock{mMutex};
+            print_helper<false>(std::cout, "[", thread_id, "] ", messages_...);
+          }
+        , messages
+        );
+      });
+    }
+  };
 
   class FileDescriptor final {
   private:
     int mHandle;
   public:
     FileDescriptor() : mHandle{-1} {}
-    FileDescriptor(char const *path)
+    FileDescriptor(Logger &log, char const *path)
       : mHandle{open(path, O_RDWR)}
     {
-      if (!mHandle) perror("Couldn't open file");
+      if (!mHandle) log.perror("Couldn't open file");
     }
 
     FileDescriptor(FileDescriptor const &) = delete;
@@ -95,22 +176,24 @@ namespace {
   namespace drm {
     class Descriptor final {
     private:
+      Logger *mLog;
       FileDescriptor mFile;
-      Descriptor(FileDescriptor file) : mFile{std::move(file)}
+      Descriptor(Logger &log, FileDescriptor file)
+        : mLog{&log}, mFile{std::move(file)}
       { assert(*this); }
     public:
       Descriptor() = default;
-      static Descriptor create(char const *path) {
-        FileDescriptor file{path};
+      static Descriptor create(Logger &log, char const *path) {
+        FileDescriptor file{log, path};
         if (!file) return {};
 
         int error = drmSetMaster(file.get());
         if (error) {
-          perror("Couldn't become drm master!");
+          log.perror("Couldn't become drm master!");
           return {};
         }
 
-        return {std::move(file)};
+        return {log, std::move(file)};
       }
       Descriptor(Descriptor const &) = delete;
       Descriptor &operator=(Descriptor const &) = delete;
@@ -119,12 +202,12 @@ namespace {
       ~Descriptor() {
         if (!*this) return;
         int error = drmDropMaster(mFile.get());
-        if (error) std::cerr << "Error dropping drm master!" << std::endl;
+        if (error) mLog->error("Error dropping drm master!");
       }
 
-      explicit operator bool() const { return static_cast<bool>(mFile); }
+      explicit operator bool() const { return (mLog != nullptr) && mFile; }
 
-      int get() const { return mFile.get(); }
+      int get() const { assert(*this); return mFile.get(); }
     };
 
     class Encoder final {
@@ -136,12 +219,12 @@ namespace {
       std::unique_ptr<drmModeEncoder, decltype(&safe_delete)> mHandle;
     public:
       Encoder() : mHandle{nullptr, &safe_delete} {}
-      Encoder(drm::Descriptor const &gpu, uint32_t encoder_id)
+      Encoder(Logger &log, drm::Descriptor const &gpu, uint32_t encoder_id)
         : mHandle{
             drmModeGetEncoder(gpu.get(), encoder_id)
           , &safe_delete
           }
-      { if (!mHandle) perror("Couldn't get encoder"); }
+      { if (!mHandle) log.perror("Couldn't get encoder"); }
 
       explicit operator bool() const { return mHandle != nullptr; }
 
@@ -165,12 +248,12 @@ namespace {
       ;
     public:
       Connector() : mHandle{nullptr, &safe_delete} {}
-      Connector(drm::Descriptor const &gpu, uint32_t connector_id)
+      Connector(Logger &log, drm::Descriptor const &gpu, uint32_t connector_id)
         : mHandle{
             drmModeGetConnector(gpu.get(), connector_id)
           , &safe_delete
           }
-      { if (!mHandle) std::cerr << "Couldn't get connector" << std::endl; }
+      { if (!mHandle) log.error("Couldn't get connector"); }
 
       explicit operator bool() const { return mHandle != nullptr; }
 
@@ -189,7 +272,7 @@ namespace {
         return mHandle->encoder_id;
       }
 
-      drmModeModeInfo *find_best_mode() const {
+      drmModeModeInfo *find_best_mode(Logger &log) const {
         assert(*this);
         drmModeModeInfo *result = nullptr;
         for (int i = 0, biggest_area = 0; i < mHandle->count_modes; i++) {
@@ -201,7 +284,7 @@ namespace {
             biggest_area = area;
           }
         }
-        if (!result) std::cerr << "No mode found" << std::endl;
+        if (!result) log.error("No mode found");
         return result;
       }
 
@@ -220,9 +303,9 @@ namespace {
       std::unique_ptr<drmModeRes, decltype(&safe_delete)> mHandle;
 
     public:
-      Resources(drm::Descriptor const &gpu)
+      Resources(Logger &log, drm::Descriptor const &gpu)
         : mHandle{drmModeGetResources(gpu.get()), &safe_delete}
-      { if (!mHandle) perror("Couldn't retrieve DRM resources"); }
+      { if (!mHandle) log.perror("Couldn't retrieve DRM resources"); }
 
       explicit operator bool() const { return mHandle != nullptr; }
 
@@ -268,7 +351,8 @@ namespace {
       // keeps a reference to the gpu descriptor, so its use should be limited
       // to the scope of the owner of the gpu descriptor.
       static FrameBuffer *create(
-        drm::Descriptor const &gpu
+        Logger &log
+      , drm::Descriptor const &gpu
       , uint32_t width, uint32_t height
       , uint32_t pitch, uint32_t bo_handle
       ) {
@@ -286,7 +370,7 @@ namespace {
         , bo_handle, &framebuffer_id
         );
         if (error) {
-          perror("Failed to create framebuffer");
+          log.perror("Failed to create framebuffer");
           return nullptr;
         }
 
@@ -297,14 +381,14 @@ namespace {
     };
 
     bool set_mode(
-      Descriptor const &gpu, FrameBuffer const &framebuffer
+      Logger &log, Descriptor const &gpu, FrameBuffer const &framebuffer
     , uint32_t connector_id, uint32_t crtc_id, drmModeModeInfo &mode
     ) {
       int error = drmModeSetCrtc(
         gpu.get(), crtc_id, framebuffer.get(), 0, 0, &connector_id, 1, &mode
       );
       if (error) {
-        perror("Failed to set mode");
+        log.perror("Failed to set mode");
         return false;
       } else {
         return true;
@@ -318,7 +402,7 @@ namespace {
 
     // Holds a reference to page_flip_pending
     bool begin_page_flip(
-      Descriptor const &gpu, FrameBuffer const &framebuffer
+      Logger &log, Descriptor const &gpu, FrameBuffer const &framebuffer
     , uint32_t crtc_id, FlipData &flip_data
     ) {
       int error = drmModePageFlip(
@@ -326,7 +410,7 @@ namespace {
       , DRM_MODE_PAGE_FLIP_EVENT, &flip_data
       );
       if (error) {
-        perror("Page flip failed");
+        log.perror("Page flip failed");
         return false;
       } else {
         flip_data.flip_is_pending = true;
@@ -373,9 +457,9 @@ namespace {
       std::unique_ptr<gbm_device, decltype(&safe_delete)> mHandle;
     public:
       Device() : mHandle{nullptr, &safe_delete} {}
-      Device(drm::Descriptor &gpu)
+      Device(Logger &log, drm::Descriptor &gpu)
         : mHandle{gbm_create_device(gpu.get()), &safe_delete}
-      { if (!mHandle) std::cerr << "Failed to create GBM device" << std::endl; }
+      { if (!mHandle) log.error("Failed to create GBM device"); }
 
       explicit operator bool() const { return mHandle != nullptr; }
 
@@ -431,10 +515,10 @@ namespace {
 
       explicit operator bool() const { return static_cast<bool>(mHandle); }
 
-      static FrontBuffer create(gbm_surface &surface) {
+      static FrontBuffer create(Logger &log, gbm_surface &surface) {
         gbm_bo *buffer = gbm_surface_lock_front_buffer(&surface);
         if (buffer == nullptr) {
-          std::cerr << "Failed to lock front buffer!" << std::endl;
+          log.error("Failed to lock front buffer!");
           return FrontBuffer{};
         }
         return FrontBuffer{surface, *buffer};
@@ -444,7 +528,9 @@ namespace {
       // course there is no hook for buffer creation, so we end up attaching
       // framebuffers to buffer objects on the fly. This returns nullptr on
       // error.
-      drm::FrameBuffer *ensure_framebuffer(drm::Descriptor const &gpu) {
+      drm::FrameBuffer *ensure_framebuffer(
+        Logger &log, drm::Descriptor const &gpu
+      ) {
         assert(*this);
 
         auto framebuffer = static_cast<drm::FrameBuffer *>(
@@ -452,7 +538,7 @@ namespace {
         );
         if (framebuffer != nullptr) return framebuffer;
         framebuffer = drm::FrameBuffer::create(
-          gpu
+          log, gpu
         , gbm_bo_get_width(mHandle.get())
         , gbm_bo_get_height(mHandle.get())
         , gbm_bo_get_stride(mHandle.get())
@@ -480,8 +566,9 @@ namespace {
       }
       std::unique_ptr<gbm_surface, decltype(&safe_delete)> mHandle;
     public:
-      Surface(Device const &device, uint32_t width, uint32_t height)
-        : mHandle{
+      Surface(
+        Logger &log, Device const &device, uint32_t width, uint32_t height
+      ) : mHandle{
             // Note that gbm_surface_create_with_modifiers also exists
             gbm_surface_create(
               device.get(), width, height
@@ -495,7 +582,7 @@ namespace {
           , &safe_delete
           }
       {
-        if (!mHandle) std::cerr << "Failed to create GBM surface" << std::endl;
+        if (!mHandle) log.error("Failed to create GBM surface");
       }
       Surface() : mHandle{nullptr, &safe_delete} {}
 
@@ -506,9 +593,9 @@ namespace {
         return mHandle.get();
       }
 
-      FrontBuffer lock_front_buffer() {
+      FrontBuffer lock_front_buffer(Logger &log) {
         assert(*this);
-        return FrontBuffer::create(*mHandle);
+        return FrontBuffer::create(log, *mHandle);
       }
     };
   }
@@ -543,46 +630,40 @@ namespace {
         return mDisplay;
       }
 
-      static Display create(gbm::Device const &gbm) {
+      static Display create(Logger &log, gbm::Device const &gbm) {
         auto get_platform_display = reinterpret_cast<
           PFNEGLGETPLATFORMDISPLAYEXTPROC
         >(
           eglGetProcAddress("eglGetPlatformDisplayEXT")
         );
         if (get_platform_display == nullptr) {
-          std::cerr << "Couldn't find eglGetPlatformDisplay" << std::endl;
+          log.error("Couldn't find eglGetPlatformDisplay");
           return {};
         }
         EGLDisplay display = get_platform_display(
           EGL_PLATFORM_GBM_KHR, gbm.get(), nullptr
         );
         if (display == EGL_NO_DISPLAY) {
-          std::cerr << "Couldn't find EGL display" << std::endl;
+          log.error("Couldn't find EGL display");
           return {};
         }
 
         EGLint major, minor;
         EGLBoolean success = eglInitialize(display, &major, &minor); 
         if (!success) {
-          std::cerr << "Couldn't initialize EGL" << std::endl;
+          log.error("Couldn't initialize EGL");
           return {};
         }
 
-        std::cout << "EGL Version: " << eglQueryString(display, EGL_VERSION)
-          << std::endl
-        ;
-        std::cout << "EGL Vendor: " << eglQueryString(display, EGL_VENDOR)
-          << std::endl
-        ;
-        std::cout << "EGL Extensions: "
-          << eglQueryString(display, EGL_EXTENSIONS) << std::endl
-        ;
+        log.info("EGL Version: ", eglQueryString(display, EGL_VERSION));
+        log.info("EGL Vendor: ", eglQueryString(display, EGL_VENDOR));
+        log.info("EGL Extensions: ", eglQueryString(display, EGL_EXTENSIONS));
 
         return {display};
       }
     };
 
-    EGLConfig find_config(Display const &display) {
+    EGLConfig find_config(Logger &log, Display const &display) {
       static constexpr EGLint config_attributes[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT
       , EGL_RED_SIZE, 1
@@ -599,7 +680,7 @@ namespace {
         display.get(), config_attributes, &config, 1, &num_processed
       );
       if (!success || num_processed != 1 || config == nullptr) {
-        std::cerr << "eglChooseConfig failed" << std::endl;
+        log.error("eglChooseConfig failed");
         return nullptr;
       }
       return config;
@@ -648,14 +729,15 @@ namespace {
       // Keeps a reference to the display!
       // This function creates global, thread-local state! See ThreadContext.
       static Context create(
-        Display const &display, EGLConfig config
+        Logger &log
+      , Display const &display, EGLConfig config
       , Context const *shared_context = nullptr
       ) {
         assert(config != nullptr);
 
         EGLBoolean success = eglBindAPI(EGL_OPENGL_ES_API);
         if (!success) {
-          std::cerr << "Couldn't use OpenGL ES 3" << std::endl;
+          log.error("Couldn't use OpenGL ES 3");
           return {};
         }
 
@@ -672,7 +754,7 @@ namespace {
           display.get(), config, share, attributes
         );
         if (context == EGL_NO_CONTEXT) {
-          std::cerr << "Failed to create OpenGL context" << std::endl;
+          log.error("Failed to create OpenGL context");
           return {};
         }
 
@@ -710,7 +792,7 @@ namespace {
       EGLSurface get() const { assert(*this); return mSurface; }
 
       static Surface create(
-        Display const &display, EGLConfig config
+        Logger &log, Display const &display, EGLConfig config
       , gbm::Surface const &gbm_surface
       ) {
         assert(config != nullptr);
@@ -718,7 +800,7 @@ namespace {
           display.get(), config, gbm_surface.get(), nullptr
         );
         if (surface == EGL_NO_SURFACE) {
-          std::cerr << "Failed to create EGL surface" << std::endl;
+          log.error("Failed to create EGL surface");
           return {};
         } else {
           return {display.get(), surface};
@@ -754,20 +836,21 @@ namespace {
 
       // This function creates global, thread-local state! See ThreadContext.
       static BoundContext create(
-        Display const &display, Surface const &surface, Context const &context
+        Logger &log
+      , Display const &display, Surface const &surface, Context const &context
       ) {
         EGLBoolean success = eglMakeCurrent(
           display.get(), surface.get(), surface.get(), context.get()
         );
         if (!success) {
-          std::cerr << "Failed to make context current" << std::endl;
+          log.error("Failed to make context current");
           return {};
         }
         return {display.get()};
       }
 
       static BoundContext create(
-        Display const &display, Context const &context
+        Logger &log, Display const &display, Context const &context
       ) {
         // Something is wrong if this thread already has a context bound
         assert(eglGetCurrentContext() == EGL_NO_CONTEXT);
@@ -776,7 +859,7 @@ namespace {
           display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, context.get()
         );
         if (!success) {
-          std::cerr << "Failed to make context current" << std::endl;
+          log.error("Failed to make context current");
           return {};
         }
         return {display.get()};
@@ -802,20 +885,21 @@ namespace {
       DrawableContext() = default;
 
       static DrawableContext create(
-        Display const &display
+        Logger &log
+      , Display const &display
       , gbm::Surface const &gbm_surface
       , Context const *shared = nullptr
       ) {
-        EGLConfig config = find_config(display);
+        EGLConfig config = find_config(log, display);
         if (!config) return {};
 
-        auto context = Context::create(display, config, shared);
+        auto context = Context::create(log, display, config, shared);
         if (!context) return {};
 
-        auto surface = Surface::create(display, config, gbm_surface);
+        auto surface = Surface::create(log, display, config, gbm_surface);
         if (!surface) return {};
 
-        auto bound = BoundContext::create(display, surface, context);
+        auto bound = BoundContext::create(log, display, surface, context);
         if (!bound) return {};
 
         return {std::move(context), std::move(surface), std::move(bound)};
@@ -846,14 +930,14 @@ namespace {
     public:
       SurfacelessContext() = default;
 
-      static SurfacelessContext create(Display const &display) {
-        EGLConfig config = find_config(display);
+      static SurfacelessContext create(Logger &log, Display const &display) {
+        EGLConfig config = find_config(log, display);
         if (!config) return {};
 
-        auto context = Context::create(display, config);
+        auto context = Context::create(log, display, config);
         if (!context) return {};
 
-        auto bound = BoundContext::create(display, context);
+        auto bound = BoundContext::create(log, display, context);
         if (!bound) return {};
 
         return {std::move(context), std::move(bound)};
@@ -863,13 +947,45 @@ namespace {
 
       // Call this on another thread!
       DrawableContext create_child_context(
-        Display const &display, gbm::Surface const &gbm_surface
+        Logger &log, Display const &display, gbm::Surface const &gbm_surface
       ) const {
         assert(*this);
-        return DrawableContext::create(display, gbm_surface, &mContext);
+        return DrawableContext::create(log, display, gbm_surface, &mContext);
       }
     };
   }
+
+  class GPU final {
+  private:
+    drm::Descriptor mDRM;
+    gbm::Device mGBM;
+    egl::Display mEGL;
+
+    GPU(drm::Descriptor drm, gbm::Device gbm, egl::Display egl)
+      : mDRM{std::move(drm)}, mGBM{std::move(gbm)}, mEGL{std::move(egl)}
+    {}
+  public:
+    GPU() = default;
+
+    drm::Descriptor const &drm() const { return mDRM; }
+    gbm::Device const &gbm() const { return mGBM; }
+    egl::Display const &egl() const { return mEGL; }
+
+    static GPU create(Logger &log, char const *path) {
+      auto drm = drm::Descriptor::create(log, path);
+      if (!drm) return {};
+
+      gbm::Device gbm{log, drm};
+      if (!gbm) return {};
+
+      auto egl = egl::Display::create(log, gbm);
+      if (!egl) return {};
+
+      return {std::move(drm), std::move(gbm), std::move(egl)};
+    }
+
+    explicit operator bool() const { return mDRM && mGBM && mEGL; }
+  };
 
   // Instances of this class contain implicit global, thread-local state due
   // to the nature of the EGL/OpenGL APIs. It should not be moved across
@@ -896,14 +1012,14 @@ namespace {
     { assert(*this); }
 
     static std::optional<ActiveDisplay> create(
-      gbm::Device const &gbm, egl::Display const &egl
+      Logger &log, gbm::Device const &gbm, egl::Display const &egl
     , uint32_t width, uint32_t height
     , uint32_t crtc_id // TODO - needed?
     ) {
-      gbm::Surface gbm_surface{gbm, width, height};
+      gbm::Surface gbm_surface{log, gbm, width, height};
       if (!gbm_surface) return std::nullopt;
 
-      auto context = egl::DrawableContext::create(egl, gbm_surface);
+      auto context = egl::DrawableContext::create(log, egl, gbm_surface);
       if (!context) return std::nullopt;
 
       return std::make_optional<ActiveDisplay>(
@@ -919,7 +1035,8 @@ namespace {
     uint32_t crtc_id() const { assert(*this); return mFlipData.crtc_id; }
 
     bool set_mode(
-      drm::Descriptor const &gpu
+      Logger &log
+    , drm::Descriptor const &gpu
     , egl::Display const &egl_display
     , uint32_t connector_id
     , drmModeModeInfo &mode
@@ -928,12 +1045,12 @@ namespace {
       glClearColor(0.5, 0.5, 0.5, 1.0);
       glClear(GL_COLOR_BUFFER_BIT);
       mEGL.swap_buffers(egl_display);
-      auto front = mSurface.lock_front_buffer();
+      auto front = mSurface.lock_front_buffer(log);
       if (!front) return false;
-      auto framebuffer = front.ensure_framebuffer(gpu);
+      auto framebuffer = front.ensure_framebuffer(log, gpu);
       if (!framebuffer) return false;
       if (drm::set_mode(
-        gpu, *framebuffer, connector_id, mFlipData.crtc_id, mode
+        log, gpu, *framebuffer, connector_id, mFlipData.crtc_id, mode
       )) {
         mCurrentFrontBuffer = std::move(front);
         return true;
@@ -943,17 +1060,18 @@ namespace {
     }
 
     bool begin_swap_buffers(
-      drm::Descriptor const &gpu
+      Logger &log
+    , drm::Descriptor const &gpu
     , egl::Display const &egl_display
     ) {
       assert(*this && mCurrentFrontBuffer);
       mEGL.swap_buffers(egl_display);
-      auto front = mSurface.lock_front_buffer();
+      auto front = mSurface.lock_front_buffer(log);
       if (!front) return false;
-      auto framebuffer = front.ensure_framebuffer(gpu);
+      auto framebuffer = front.ensure_framebuffer(log, gpu);
       if (!framebuffer) return false;
       bool success = drm::begin_page_flip(
-        gpu, *framebuffer, mFlipData.crtc_id, mFlipData
+        log, gpu, *framebuffer, mFlipData.crtc_id, mFlipData
       );
       if (success) mNextFrontBuffer = std::move(front);
       return success;
@@ -975,8 +1093,6 @@ namespace {
     }
   };
 
-  namespace asio = boost::asio;
-
   class DisplayMode {
   private:
     drm::Connector mConnector;
@@ -992,13 +1108,14 @@ namespace {
     { assert(*this); }
 
     static std::optional<uint32_t> find_crtc(
-      drm::Descriptor const &drm
+      Logger &log
+    , drm::Descriptor const &drm
     , drm::Connector const &connector
     , drm::Resources const &resources
     , std::set<uint32_t> const &available_crtcs
     ) {
       for (uint32_t encoder_id : connector.encoders()) {
-        drm::Encoder encoder{drm, encoder_id};
+        drm::Encoder encoder{log, drm, encoder_id};
         if (!encoder) continue;
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
@@ -1007,7 +1124,7 @@ namespace {
           ++i;
         }
       }
-      std::cerr << "No crtc found" << std::endl;
+      log.error("No crtc found");
       return std::nullopt;
     }
 
@@ -1024,21 +1141,21 @@ namespace {
     uint32_t height() const { assert(*this); return mMode->vdisplay; }
 
     static DisplayMode create(
-      drm::Descriptor const &drm
+      Logger &log
+    , drm::Descriptor const &drm
     , drm::Resources const &resources
     , std::set<uint32_t> const &available_crtcs
     , drm::Connector connector
     ) {
-      drmModeModeInfo *mode = connector.find_best_mode();
+      drmModeModeInfo *mode = connector.find_best_mode(log);
       if (!mode) return {};
 
-      auto crtc_id = find_crtc(drm, connector, resources, available_crtcs);
+      auto crtc_id = find_crtc(log, drm, connector, resources, available_crtcs);
       if (!crtc_id) return {};
 
-      std::cout << "Found display " << *crtc_id
-                << " at " << mode->hdisplay << "x" << mode->vdisplay
-                << std::endl
-      ;
+      log.info(
+        "Found display ", *crtc_id, " at ", mode->hdisplay, "x", mode->vdisplay
+      );
 
       return {std::move(connector), mode, *crtc_id};
     }
@@ -1047,33 +1164,53 @@ namespace {
   template <typename DrawCallback>
   class DrawRoutine final {
   private:
+    class BorrowedDescriptor {
+    private:
+      asio::posix::stream_descriptor mDescriptor;
+    public:
+      template <typename ...Args>
+      BorrowedDescriptor(Args&&... args)
+        : mDescriptor{std::forward<Args>(args)...}
+      {}
+      ~BorrowedDescriptor() {
+        if (mDescriptor.is_open()) mDescriptor.release();
+      }
+
+      asio::posix::stream_descriptor &get() {
+        assert(mDescriptor.is_open());
+        return mDescriptor;
+      }
+
+      void cancel() { mDescriptor.cancel(); }
+    };
+
     enum class State { MODE_SET, DRAWING, PAGE_FLIP, STOPPED };
+    Logger &mLog;
     std::atomic<bool> const &mKeepRunning;
     asio::io_service &mASIO;
-    drm::Descriptor const&mDRM;
-    egl::Display const &mEGL;
+    GPU const &mGPU;
     DisplayMode mMode;
-    asio::posix::stream_descriptor mDescriptor;
+    BorrowedDescriptor mDescriptor;
     std::optional<ActiveDisplay> mDisplay;
     DrawCallback mDrawCallback;
     State mState;
 
     DrawRoutine(
-      std::atomic<bool> const &keep_running
+      Logger &log
+    , std::atomic<bool> const &keep_running
     , asio::io_service &asio
-    , drm::Descriptor const &drm
-    , gbm::Device const &gbm
-    , egl::Display const &egl
+    , GPU const &gpu
     , DisplayMode mode
     , DrawCallback draw_callback
-    ) : mKeepRunning{keep_running}
+    ) : mLog{log}
+      , mKeepRunning{keep_running}
       , mASIO{asio}
-      , mDRM{drm}
-      , mEGL{egl}
+      , mGPU{gpu}
       , mMode{std::move(mode)}
-      , mDescriptor{asio, drm.get()}
+      , mDescriptor{asio, gpu.drm().get()}
       , mDisplay{ActiveDisplay::create(
-          gbm, egl, mMode.width(), mMode.height(), mMode.crtc_id()
+          log, mGPU.gbm(), mGPU.egl()
+        , mMode.width(), mMode.height(), mMode.crtc_id()
         )}
       , mDrawCallback{std::move(draw_callback)}
       , mState{State::MODE_SET}
@@ -1110,14 +1247,8 @@ namespace {
         assert(*self);
 
         if (error) {
-          std::cerr << "ASIO error: " << error.message() << std::endl;
-          std::cerr << "Thread exiting due to error" << std::endl;
-          return;
-        }
-
-        if (!self->mKeepRunning) {
-          std::cout << "Thread exiting due to external request" << std::endl;
-          self->mState = State::STOPPED;
+          self->mLog.error("ASIO error: ", error.message());
+          self->mLog.error("Thread exiting due to error");
           return;
         }
 
@@ -1126,10 +1257,11 @@ namespace {
           assert(false);
         case State::MODE_SET:
           if (!self->mDisplay->set_mode(
-            self->mDRM, self->mEGL
+            self->mLog
+          , self->mGPU.drm(), self->mGPU.egl()
           , self->mMode.connector_id(), self->mMode.info()
           )) {
-            std::cerr << "Thread exiting due to error" << std::endl;
+            self->mLog.error("Thread exiting due to error");
             return;
           }
           self->mState = State::DRAWING;
@@ -1137,30 +1269,46 @@ namespace {
           return;
         case State::DRAWING:
           // Do the drawing
+          self->mLog.info("Draw");
           self->mDrawCallback();
 
           // Begin the flip
-          if (!self->mDisplay->begin_swap_buffers(self->mDRM, self->mEGL)) {
-            std::cerr << "Thread exiting due to error" << std::endl;
+          if (!self->mDisplay->begin_swap_buffers(
+            self->mLog, self->mGPU.drm(), self->mGPU.egl()
+          )) {
+            self->mLog.error("Thread exiting due to error");
             return;
           }
           // Wait for the flip
           self->mState = State::PAGE_FLIP;
           asio::async_read(
-            self->mDescriptor, asio::null_buffers(), std::move(*this)
+            self->mDescriptor.get(), asio::null_buffers(), std::move(*this)
           );
           return;
         case State::PAGE_FLIP:
-          self->mDisplay->handle_event(self->mDRM);
+          self->mDisplay->handle_event(self->mGPU.drm());
           if (self->mDisplay->buffer_swap_is_pending()) {
             // Keep waiting
             asio::async_read(
-              self->mDescriptor, asio::null_buffers(), std::move(*this)
+              self->mDescriptor.get(), asio::null_buffers(), std::move(*this)
             );
             return;
           } else {
             // Complete the flip
             self->mDisplay->finish_swap_buffers();
+
+            // We're not syncing other state here, just reading the value, so
+            // memory_order_relaxed is fine. We do this here to let any pending
+            // page flip complete before terminating.
+            if (!self->mKeepRunning.load(std::memory_order_relaxed)) {
+              //using namespace std::chrono_literals;
+              //std::cout << std::this_thread::get_id() << " " << "Thread exiting due to external request" << std::endl;
+              self->mLog.info("Ignoring exit request");
+              //std::this_thread::sleep_for(5s);
+              //std::cout << std::this_thread::get_id() << " " << "Thread exited due to external request" << std::endl;
+              //self->mState = State::STOPPED;
+              //return;
+            }
 
             // Draw the next frame
             self->mState = State::DRAWING;
@@ -1177,38 +1325,21 @@ namespace {
     }
 
     static void begin(
-      std::atomic<bool> const &keep_running
+      Logger &log
+    , std::atomic<bool> const &keep_running
     , asio::io_service &asio
-    , drm::Descriptor const &drm
-    , gbm::Device const &gbm
-    , egl::Display const &egl
+    , GPU const &gpu
     , DisplayMode mode
     , DrawCallback draw_callback
     ) {
       DrawRoutine<DrawCallback> state{
-        keep_running, asio, drm, gbm, egl
+        log, keep_running, asio, gpu
       , std::move(mode), std::move(draw_callback)
       };
       if (!state) return;
       Worker{state}();
       asio.run();
     }
-  };
-
-  class RAIIThread {
-  private:
-    std::thread mThread;
-  public:
-    RAIIThread() = default;
-    template <typename ...Args>
-    RAIIThread(Args&&... args) : mThread{std::forward<Args>(args)...} {}
-    RAIIThread(RAIIThread const &) = delete;
-    RAIIThread &operator=(RAIIThread const &) = delete;
-    RAIIThread(RAIIThread &&) = default;
-    RAIIThread &operator=(RAIIThread &&) = default;
-    ~RAIIThread() { if (*this) mThread.join(); }
-
-    explicit operator bool() const { return mThread.joinable(); }
   };
 
   class DrawThread final {
@@ -1221,7 +1352,6 @@ namespace {
     // Run something on the drawing thread
     template <typename Callback>
     void post(Callback &&callback) {
-      assert(*this);
       mASIO.post(std::forward<Callback>(callback));
     }
 
@@ -1233,23 +1363,23 @@ namespace {
 
     template <typename DrawCallback>
     DrawThread(
-      drm::Descriptor const &drm
-    , gbm::Device const &gbm
-    , egl::Display const &egl
+      Logger &log
+    , GPU const &gpu
     , DisplayMode mode
     , DrawCallback draw_callback
     ) : mKeepRunning{true}
       , mASIO{}
       , mCrtcID{mode.crtc_id()}
       , mThread{[
-          this, &drm, &gbm, &egl
+          this, &log, &gpu
         , mode = std::move(mode)
         , draw_callback = std::move(draw_callback)
         ]() mutable {
           DrawRoutine<DrawCallback>::begin(
-            mKeepRunning
+            log
+          , mKeepRunning
           , mASIO
-          , drm, gbm, egl
+          , gpu
           , std::move(mode)
           , std::move(draw_callback)
           );
@@ -1259,67 +1389,64 @@ namespace {
 
   class DeviceManager final {
   private:
-    drm::Descriptor mDRM;
-    gbm::Device mGBM;
-    egl::Display mEGL;
+    Logger *mLog;
+    GPU mGPU;
     // The keys here are connector ids returned from libdrm. The hope is that
     // they are consistent across reboots etc.
     std::map<uint32_t, DrawThread> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
     DeviceManager(
-      drm::Descriptor gpu, gbm::Device gbm, egl::Display egl
-    , std::set<uint32_t> unused_crtcs
-    ) : mDRM{std::move(gpu)}
-      , mGBM{std::move(gbm)}
-      , mEGL{std::move(egl)}
+      Logger &log, GPU gpu, std::set<uint32_t> unused_crtcs
+    ) : mLog{&log}
+      , mGPU{std::move(gpu)}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
     { assert(*this); }
 
   public:
-    DeviceManager() : DeviceManager({}, {}, {}, {}) {}
+    DeviceManager() = default;
 
-    static DeviceManager create(char const *path) {
-      auto gpu = drm::Descriptor::create(path);
+    // Keeps a reference to the logger!
+    static DeviceManager create(Logger &log, char const *path) {
+      // TODO
+      auto gpu = GPU::create(log, path);
       if (!gpu) return {};
 
-      drm::Resources resources{gpu};
+      drm::Resources resources{log, gpu.drm()};
       if (!resources) return {};
-
-      gbm::Device gbm{gpu};
-      if (!gbm) return {};
-
-      auto egl = egl::Display::create(gbm);
-      if (!egl) return {};
 
       std::set<uint32_t> unused_crtcs{};
       for (uint32_t crtc_id : resources.crtcs()) unused_crtcs.insert(crtc_id);
 
-      return {
-        std::move(gpu), std::move(gbm), std::move(egl), std::move(unused_crtcs)
-      };
+      return {log, std::move(gpu), std::move(unused_crtcs)};
     }
 
     explicit operator bool() const {
-      return mDRM && mGBM && mEGL;
+      return (mLog != nullptr) && mGPU;
     }
 
     void stop_threads() {
+      assert(*this);
+      //int i = 0;
       for (auto &pair : mDisplayLookup) {
+        //if (i == 0) {
         DrawThread &thread = pair.second;
         thread.stop();
+        //}
+        //i++;
       }
+      mLog->stop();
     }
 
     void update_connections() {
       assert(*this);
 
-      drm::Resources resources{mDRM};
+      drm::Resources resources{*mLog, mGPU.drm()};
       if (!resources) return;
 
       for (uint32_t connector_id : resources.connectors()) {
-        drm::Connector connector{mDRM, connector_id};
+        drm::Connector connector{*mLog, mGPU.drm(), connector_id};
         if (!connector) continue;
 
         if (
@@ -1335,7 +1462,7 @@ namespace {
           // Someone plugged it in!
 
           auto mode = DisplayMode::create(
-            mDRM, resources, mUnusedCrtcs, std::move(connector)
+            *mLog, mGPU.drm(), resources, mUnusedCrtcs, std::move(connector)
           );
           if (!mode) continue;
 
@@ -1349,7 +1476,7 @@ namespace {
             std::piecewise_construct
           , std::forward_as_tuple(connector_id)
           , std::forward_as_tuple(
-              mDRM, mGBM, mEGL, std::move(mode)
+              *mLog, mGPU, std::move(mode)
             , [red, green, blue]() {
                 glClearColor(red, green, blue, 1.0);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -1369,20 +1496,33 @@ namespace {
 }
 
 int main() {
+  //using namespace std::chrono_literals;
   asio::io_service asio{};
-  asio::signal_set signals{asio, SIGINT, SIGTERM};
-  auto drm = DeviceManager::create("/dev/dri/card0");
+  //auto timer = std::make_optional<asio::steady_timer>(asio, 5s);
+  //asio::signal_set signals{asio, SIGINT, SIGTERM};
+  Logger logger{};
+  auto drm = DeviceManager::create(logger, "/dev/dri/card0");
   if (!drm) return EXIT_FAILURE;
   drm.update_connections();
-  signals.async_wait([&](
-    boost::system::error_code const &error, int /*signal*/
-  ) {
-    if (error) {
-      std::cerr << "Problem with signal handler" << std::endl;
-      return;
-    }
-    drm.stop_threads();
-  });
+  //signals.async_wait([&](
+  //  boost::system::error_code const &error, int /*signal*/
+  //) {
+  //  if (error) {
+  //    std::cerr << "Problem with signal handler" << std::endl;
+  //    return;
+  //  }
+  //  drm.stop_threads();
+  //});
+  //timer->async_wait([&](
+  //  boost::system::error_code const &error
+  //) {
+  //  if (error) {
+  //    std::cerr << "Problem with signal handler" << std::endl;
+  //    return;
+  //  }
+  //  drm.stop_threads();
+  //  timer = std::nullopt;
+  //});
   asio.run();
   return EXIT_SUCCESS;
 }
