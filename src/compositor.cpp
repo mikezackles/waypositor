@@ -96,7 +96,8 @@ namespace {
     class Descriptor final {
     private:
       FileDescriptor mFile;
-      Descriptor(FileDescriptor file) : mFile{std::move(file)} {}
+      Descriptor(FileDescriptor file) : mFile{std::move(file)}
+      { assert(*this); }
     public:
       Descriptor() = default;
       static Descriptor create(char const *path) {
@@ -424,7 +425,7 @@ namespace {
 
       FrontBuffer(gbm_surface &surface, gbm_bo &buffer)
         : mHandle{&surface, &buffer}
-      {}
+      { assert(*this); }
     public:
       FrontBuffer() = default;
 
@@ -516,7 +517,7 @@ namespace {
     class Display final {
     private:
       EGLDisplay mDisplay;
-      Display(EGLDisplay display) : mDisplay{display} {}
+      Display(EGLDisplay display) : mDisplay{display} { assert(*this); }
     public:
       Display() : mDisplay{EGL_NO_DISPLAY} {}
       Display(Display const &) = delete;
@@ -532,7 +533,7 @@ namespace {
         return *this;
       }
       ~Display() {
-        if (mDisplay != EGL_NO_DISPLAY) eglTerminate(mDisplay);
+        if (*this) eglTerminate(mDisplay);
       }
 
       explicit operator bool() const { return mDisplay != EGL_NO_DISPLAY; }
@@ -611,7 +612,7 @@ namespace {
       EGLConfig mConfig;
       Context(EGLDisplay display, EGLContext context, EGLConfig config)
         : mDisplay{display}, mContext{context}, mConfig{config}
-      {}
+      { assert(*this); }
     public:
       Context() : mDisplay{}, mContext{EGL_NO_CONTEXT}, mConfig{nullptr} {}
       Context(Context const &) = delete;
@@ -619,9 +620,11 @@ namespace {
       Context(Context &&other) noexcept
         : mDisplay{other.mDisplay}
         , mContext{other.mContext}
+        , mConfig{other.mConfig}
       {
         other.mDisplay = EGL_NO_DISPLAY;
         other.mContext = EGL_NO_CONTEXT;
+        other.mConfig = nullptr;
       }
       Context &operator=(Context &&other) noexcept {
         // This class is final, and nothing here can throw exceptions.
@@ -631,7 +634,7 @@ namespace {
         return *this;
       }
       ~Context() {
-        if (mContext != EGL_NO_CONTEXT) eglDestroyContext(mDisplay, mContext);
+        if (*this) eglDestroyContext(mDisplay, mContext);
       }
 
       explicit operator bool() const {
@@ -673,7 +676,7 @@ namespace {
           return {};
         }
 
-        return {display.get(), context,config};
+        return {display.get(), context, config};
       }
     };
 
@@ -683,7 +686,7 @@ namespace {
       EGLSurface mSurface;
       Surface(EGLDisplay display, EGLSurface surface)
         : mDisplay{display}, mSurface{surface}
-      {}
+      { assert(*this); }
     public:
       Surface() : mDisplay{EGL_NO_DISPLAY}, mSurface{EGL_NO_SURFACE} {}
       Surface(Surface const &) = delete;
@@ -793,7 +796,7 @@ namespace {
       ) : mContext{std::move(context)}
         , mSurface{std::move(surface)}
         , mBoundContext{std::move(bound)}
-      {}
+      { assert(*this); }
 
     public:
       DrawableContext() = default;
@@ -818,7 +821,9 @@ namespace {
         return {std::move(context), std::move(surface), std::move(bound)};
       }
 
-      explicit operator bool() const { return static_cast<bool>(mContext); }
+      explicit operator bool() const {
+        return mContext && mSurface && mBoundContext;
+      }
 
       void swap_buffers(Display const &display) {
         assert(*this);
@@ -888,7 +893,7 @@ namespace {
       , mEGL{std::move(context)}
       , mFlipData{crtc_id, false}
       , mCurrentFrontBuffer{}, mNextFrontBuffer{}
-    {}
+    { assert(*this); }
 
     static std::optional<ActiveDisplay> create(
       gbm::Device const &gbm, egl::Display const &egl
@@ -984,7 +989,7 @@ namespace {
     , uint32_t crtc_id
     ) : mConnector{std::move(connector)}
       , mMode{mode}, mCrtcID{crtc_id}
-    {}
+    { assert(*this); }
 
     static std::optional<uint32_t> find_crtc(
       drm::Descriptor const &drm
@@ -1039,6 +1044,7 @@ namespace {
     }
   };
 
+  template <typename DrawCallback>
   class DrawRoutine final {
   private:
     enum class State { MODE_SET, DRAWING, PAGE_FLIP, STOPPED };
@@ -1049,7 +1055,7 @@ namespace {
     DisplayMode mMode;
     asio::posix::stream_descriptor mDescriptor;
     std::optional<ActiveDisplay> mDisplay;
-    std::function<void()> mDrawCallback;
+    DrawCallback mDrawCallback;
     State mState;
 
     DrawRoutine(
@@ -1059,7 +1065,7 @@ namespace {
     , gbm::Device const &gbm
     , egl::Display const &egl
     , DisplayMode mode
-    , std::function<void()> draw_callback
+    , DrawCallback draw_callback
     ) : mKeepRunning{keep_running}
       , mASIO{asio}
       , mDRM{drm}
@@ -1071,7 +1077,7 @@ namespace {
         )}
       , mDrawCallback{std::move(draw_callback)}
       , mState{State::MODE_SET}
-    {}
+    { /* No assertion, could be invalid */ }
 
     class Worker final {
     private:
@@ -1167,7 +1173,7 @@ namespace {
 
   public:
     explicit operator bool() const {
-      return static_cast<bool>(mDisplay) && static_cast<bool>(*mDisplay);
+      return static_cast<bool>(mDisplay);
     }
 
     static void begin(
@@ -1177,9 +1183,9 @@ namespace {
     , gbm::Device const &gbm
     , egl::Display const &egl
     , DisplayMode mode
-    , std::function<void()> draw_callback
+    , DrawCallback draw_callback
     ) {
-      DrawRoutine state{
+      DrawRoutine<DrawCallback> state{
         keep_running, asio, drm, gbm, egl
       , std::move(mode), std::move(draw_callback)
       };
@@ -1200,7 +1206,7 @@ namespace {
     RAIIThread &operator=(RAIIThread const &) = delete;
     RAIIThread(RAIIThread &&) = default;
     RAIIThread &operator=(RAIIThread &&) = default;
-    ~RAIIThread() { if (mThread.joinable()) mThread.join(); }
+    ~RAIIThread() { if (*this) mThread.join(); }
 
     explicit operator bool() const { return mThread.joinable(); }
   };
@@ -1215,6 +1221,7 @@ namespace {
     // Run something on the drawing thread
     template <typename Callback>
     void post(Callback &&callback) {
+      assert(*this);
       mASIO.post(std::forward<Callback>(callback));
     }
 
@@ -1224,12 +1231,13 @@ namespace {
 
     explicit operator bool() const { return static_cast<bool>(mThread); }
 
+    template <typename DrawCallback>
     DrawThread(
       drm::Descriptor const &drm
     , gbm::Device const &gbm
     , egl::Display const &egl
     , DisplayMode mode
-    , std::function<void()> draw_callback
+    , DrawCallback draw_callback
     ) : mKeepRunning{true}
       , mASIO{}
       , mCrtcID{mode.crtc_id()}
@@ -1238,7 +1246,7 @@ namespace {
         , mode = std::move(mode)
         , draw_callback = std::move(draw_callback)
         ]() mutable {
-          DrawRoutine::begin(
+          DrawRoutine<DrawCallback>::begin(
             mKeepRunning
           , mASIO
           , drm, gbm, egl
@@ -1267,7 +1275,7 @@ namespace {
       , mEGL{std::move(egl)}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
-    {}
+    { assert(*this); }
 
   public:
     DeviceManager() : DeviceManager({}, {}, {}, {}) {}
