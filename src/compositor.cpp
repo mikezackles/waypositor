@@ -8,6 +8,7 @@
 
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/read.hpp>
+#include <boost/asio/signal_set.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 
 #include <cassert>
@@ -1096,7 +1097,10 @@ namespace {
       ~Worker() = default;
 
       explicit operator bool() const { return self != nullptr; }
-      void operator()(boost::system::error_code error = {}, std::size_t = 0) {
+      void operator()(
+        boost::system::error_code const &error = {}
+      , std::size_t = 0
+      ) {
         assert(*self);
 
         if (error) {
@@ -1293,6 +1297,13 @@ namespace {
       return mDRM && mGBM && mEGL;
     }
 
+    void stop_threads() {
+      for (auto &pair : mDisplayLookup) {
+        DrawThread &thread = pair.second;
+        thread.stop();
+      }
+    }
+
     void update_connections() {
       assert(*this);
 
@@ -1350,8 +1361,20 @@ namespace {
 }
 
 int main() {
+  asio::io_service asio{};
+  asio::signal_set signals{asio, SIGINT, SIGTERM};
   auto drm = DeviceManager::create("/dev/dri/card0");
   if (!drm) return EXIT_FAILURE;
   drm.update_connections();
+  signals.async_wait([&](
+    boost::system::error_code const &error, int /*signal*/
+  ) {
+    if (error) {
+      std::cerr << "Problem with signal handler" << std::endl;
+      return;
+    }
+    drm.stop_threads();
+  });
+  asio.run();
   return EXIT_SUCCESS;
 }
