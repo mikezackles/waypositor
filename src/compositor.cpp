@@ -85,6 +85,8 @@ namespace {
       }
     }
 
+    void stop() { mASIO.post([this] { mWork = std::nullopt; }); }
+
   public:
     Logger(std::string main_thread_name)
       : mASIO{}
@@ -97,6 +99,7 @@ namespace {
         std::this_thread::get_id(), std::move(main_thread_name)
       );
     }
+    ~Logger() { this->stop(); }
 
     void register_thread(std::thread::id id, std::string name) {
       std::lock_guard lock{mMutex};
@@ -107,8 +110,6 @@ namespace {
       std::lock_guard lock{mMutex};
       mNameLookup.erase(id);
     }
-
-    void stop() { mASIO.post([this] { mWork = std::nullopt; }); }
 
     // This is immediate. It's slower, but it shouldn't be running under normal
     // operation. Error messages won't be lost in the event of a crash.
@@ -1552,7 +1553,6 @@ namespace {
         //}
         //i++;
       }
-      mLog->stop();
     }
 
     void update_connections() {
