@@ -432,7 +432,7 @@ namespace {
       bool flip_is_pending;
     };
 
-    // Holds a reference to page_flip_pending
+    // Holds a reference to flip_data
     bool begin_page_flip(
       Logger &log, Descriptor const &gpu, FrameBuffer const &framebuffer
     , uint32_t crtc_id, FlipData &flip_data
@@ -1267,7 +1267,7 @@ namespace {
     // duration of io_service::run
     FPSTimer(
       Logger &log, asio::io_service &asio
-    , asio::steady_timer::duration delta = std::chrono::seconds{5}
+    , asio::steady_timer::duration delta = std::chrono::seconds{1}
     ) : mLog{log}, mTimer{asio, delta}, mFrameCount{0}, mDelta{delta}
       , mThen{Clock::now()}, mState{State::STARTING}
     { Worker{*this}(); }
@@ -1416,7 +1416,7 @@ namespace {
             // memory_order_relaxed is fine. We do this here to let any pending
             // page flip complete before terminating.
             if (!self->mKeepRunning.load(std::memory_order_relaxed)) {
-              self->mLog.info("Ignoring exit request");
+              self->mLog.info("Thread exiting due to external request");
               self->mState = State::STOPPED;
               self->mFPS.stop();
               return;
@@ -1475,8 +1475,7 @@ namespace {
 
     template <typename DrawCallback>
     DrawThread(
-      std::size_t name_id
-    , Logger &log
+      Logger &log
     , GPU const &gpu
     , DisplayMode mode
     , DrawCallback draw_callback
@@ -1499,7 +1498,7 @@ namespace {
         }}
     {
       std::stringstream name{};
-      name << "Draw " << name_id;
+      name << "Draw " << mCrtcID;
       log.register_thread(mThread.get_id(), name.str());
     }
   };
@@ -1512,7 +1511,6 @@ namespace {
     // they are consistent across reboots etc.
     std::map<uint32_t, DrawThread> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
-    std::size_t mThreadID;
 
     DeviceManager(
       Logger &log, GPU gpu, std::set<uint32_t> unused_crtcs
@@ -1520,7 +1518,6 @@ namespace {
       , mGPU{std::move(gpu)}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
-      , mThreadID{0}
     { assert(*this); }
 
   public:
@@ -1595,7 +1592,7 @@ namespace {
             std::piecewise_construct
           , std::forward_as_tuple(connector_id)
           , std::forward_as_tuple(
-              mThreadID, *mLog, mGPU, std::move(mode)
+              *mLog, mGPU, std::move(mode)
             , [red, green, blue]() {
                 glClearColor(red, green, blue, 1.0);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -1607,7 +1604,6 @@ namespace {
             mDisplayLookup.erase(connector_id);
             continue;
           }
-          mThreadID++;
           mUnusedCrtcs.erase(crtc_id);
         }
       }
@@ -1616,9 +1612,9 @@ namespace {
 }
 
 int main() {
-  using namespace std::chrono_literals;
-  asio::io_service asio{};
-  //auto timer = std::make_optional<asio::steady_timer>(asio, 5s);
+  //using namespace std::chrono_literals;
+  //asio::io_service asio{};
+  //asio::steady_timer timer{asio, 5s};
   //asio::signal_set signals{asio, SIGINT, SIGTERM};
   Logger logger{"Main"};
   auto drm = DeviceManager::create(logger, "/dev/dri/card0");
@@ -1633,17 +1629,16 @@ int main() {
   //  }
   //  drm.stop_threads();
   //});
-  //timer->async_wait([&](
+  //timer.async_wait([&](
   //  boost::system::error_code const &error
   //) {
   //  if (error) {
-  //    logger.error("Problem with signal handler");
+  //    logger.error("Problem with timer");
   //    return;
   //  }
   //  drm.stop_threads();
   //  logger.info("HI");
-  //  //timer = std::nullopt;
   //});
-  asio.run();
+  //asio.run();
   return EXIT_SUCCESS;
 }
