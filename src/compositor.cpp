@@ -123,7 +123,7 @@ namespace {
     template <typename ...Messages>
     void perror(Messages&&... messages) {
       static constexpr std::size_t errno_buffer_size = 256;
-      char buffer[errno_buffer_size];
+      char buffer[errno_buffer_size]{};
       strerror_r(errno, buffer, errno_buffer_size);
       this->error(messages..., ": ", buffer);
     }
