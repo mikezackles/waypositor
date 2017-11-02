@@ -6,7 +6,9 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <thread>
+#include <unordered_map>
 
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/read.hpp>
@@ -47,6 +49,7 @@ namespace {
     ~RAIIThread() { if (*this) mThread.join(); }
 
     explicit operator bool() const { return mThread.joinable(); }
+    std::thread::id get_id() { return mThread.get_id(); }
   };
 
   class Logger final {
@@ -54,6 +57,7 @@ namespace {
     asio::io_service mASIO;
     std::optional<asio::io_service::work> mWork;
     std::mutex mMutex;
+    std::unordered_map<std::thread::id, std::string> mNameLookup;
     RAIIThread mThread;
 
     template <bool flush, typename Message, typename ...Messages>
@@ -62,21 +66,47 @@ namespace {
     , Message &&message, Messages&&... messages
     ) {
       ostream << message;
-      if constexpr (sizeof...(messages) > 0)
+      if constexpr (sizeof...(messages) > 0) {
         print_helper<flush>(ostream, messages...);
-      else if (flush)
+      } else if (flush) {
         ostream << std::endl;
-      else
+      } else {
         ostream << "\n";
+      }
+    }
+
+    // Should be synchronized by mMutex
+    std::string_view thread_name(std::thread::id id) {
+      using namespace std::string_view_literals;
+      if (auto it = mNameLookup.find(id); it != mNameLookup.end()) {
+        return {it->second};
+      } else {
+        return "???"sv;
+      }
     }
 
   public:
-    Logger()
+    Logger(std::string main_thread_name)
       : mASIO{}
       , mWork{mASIO}
       , mMutex{}
+      , mNameLookup{}
       , mThread{[this] { mASIO.run(); }}
-    {}
+    {
+      this->register_thread(
+        std::this_thread::get_id(), std::move(main_thread_name)
+      );
+    }
+
+    void register_thread(std::thread::id id, std::string name) {
+      std::lock_guard lock{mMutex};
+      mNameLookup.emplace(id, std::move(name));
+    }
+
+    void unregister_thread(std::thread::id id) {
+      std::lock_guard lock{mMutex};
+      mNameLookup.erase(id);
+    }
 
     void stop() { mASIO.post([this] { mWork = std::nullopt; }); }
 
@@ -86,7 +116,7 @@ namespace {
     void error(Messages&&... messages) {
       std::lock_guard lock{mMutex};
       print_helper<true>(
-        std::cerr, "[", std::this_thread::get_id(), "] ", messages...
+        std::cerr, "[", thread_name(std::this_thread::get_id()), "] ", messages...
       );
     }
 
@@ -109,7 +139,9 @@ namespace {
         std::apply(
           [this, &thread_id](auto&&... messages_) {
             std::lock_guard lock{mMutex};
-            print_helper<false>(std::cout, "[", thread_id, "] ", messages_...);
+            print_helper<false>(
+              std::cout, "[", thread_name(thread_id), "] ", messages_...
+            );
           }
         , messages
         );
@@ -1269,7 +1301,7 @@ namespace {
           return;
         case State::DRAWING:
           // Do the drawing
-          self->mLog.info("Draw");
+          //self->mLog.info("Draw");
           self->mDrawCallback();
 
           // Begin the flip
@@ -1363,7 +1395,8 @@ namespace {
 
     template <typename DrawCallback>
     DrawThread(
-      Logger &log
+      std::size_t name_id
+    , Logger &log
     , GPU const &gpu
     , DisplayMode mode
     , DrawCallback draw_callback
@@ -1384,7 +1417,11 @@ namespace {
           , std::move(draw_callback)
           );
         }}
-    {}
+    {
+      std::stringstream name{};
+      name << "Draw " << name_id;
+      log.register_thread(mThread.get_id(), name.str());
+    }
   };
 
   class DeviceManager final {
@@ -1395,6 +1432,7 @@ namespace {
     // they are consistent across reboots etc.
     std::map<uint32_t, DrawThread> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
+    std::size_t mThreadID;
 
     DeviceManager(
       Logger &log, GPU gpu, std::set<uint32_t> unused_crtcs
@@ -1402,6 +1440,7 @@ namespace {
       , mGPU{std::move(gpu)}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
+      , mThreadID{0}
     { assert(*this); }
 
   public:
@@ -1476,7 +1515,7 @@ namespace {
             std::piecewise_construct
           , std::forward_as_tuple(connector_id)
           , std::forward_as_tuple(
-              *mLog, mGPU, std::move(mode)
+              mThreadID, *mLog, mGPU, std::move(mode)
             , [red, green, blue]() {
                 glClearColor(red, green, blue, 1.0);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -1488,6 +1527,7 @@ namespace {
             mDisplayLookup.erase(connector_id);
             continue;
           }
+          mThreadID++;
           mUnusedCrtcs.erase(crtc_id);
         }
       }
@@ -1496,11 +1536,11 @@ namespace {
 }
 
 int main() {
-  //using namespace std::chrono_literals;
+  using namespace std::chrono_literals;
   asio::io_service asio{};
   //auto timer = std::make_optional<asio::steady_timer>(asio, 5s);
   //asio::signal_set signals{asio, SIGINT, SIGTERM};
-  Logger logger{};
+  Logger logger{"Main"};
   auto drm = DeviceManager::create(logger, "/dev/dri/card0");
   if (!drm) return EXIT_FAILURE;
   drm.update_connections();
@@ -1517,12 +1557,14 @@ int main() {
   //  boost::system::error_code const &error
   //) {
   //  if (error) {
-  //    std::cerr << "Problem with signal handler" << std::endl;
+  //    logger.error("Problem with signal handler");
   //    return;
   //  }
   //  drm.stop_threads();
-  //  timer = std::nullopt;
+  //  logger.info("HI");
+  //  //timer = std::nullopt;
   //});
   asio.run();
+  logger.info("FINI");
   return EXIT_SUCCESS;
 }
