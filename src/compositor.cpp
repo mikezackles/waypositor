@@ -1193,6 +1193,86 @@ namespace {
     }
   };
 
+  class FPSTimer final {
+  private:
+    enum class State { STARTING, RUNNING, STOPPED };
+    using Clock = std::chrono::high_resolution_clock;
+    Logger &mLog;
+    asio::steady_timer mTimer;
+    std::size_t mFrameCount;
+    asio::steady_timer::duration mDelta;
+    std::chrono::time_point<Clock> mThen;
+    State mState;
+
+    class Worker {
+    private:
+      FPSTimer *self;
+    public:
+      Worker(FPSTimer &state) : self{&state} {}
+      Worker(Worker const &);
+      Worker &operator=(Worker const &);
+      Worker(Worker &&other) noexcept : self{other.self} {
+        other.self = nullptr;
+      }
+      Worker &operator=(Worker &&other) {
+        if (this == &other) return *this;
+        self = other.self;
+        other.self = nullptr;
+        return *this;
+      }
+      ~Worker() = default;
+
+      void run() {
+        using Seconds = std::chrono::duration<double>;
+        auto now = Clock::now();
+        Seconds delta = now - self->mThen;
+        self->mThen = now;
+        double fps = self->mFrameCount / delta.count();
+
+        self->mLog.info("FPS: ", fps, " Delta: ", delta.count(), " seconds");
+        self->mFrameCount = 0;
+
+        self->mTimer.expires_at(self->mTimer.expires_at() + self->mDelta);
+        self->mTimer.async_wait(std::move(*this));
+      }
+
+      void operator()(boost::system::error_code const &error = {}) {
+        if (error) {
+          self->mLog.error("ASIO error", error.message());
+          return;
+        }
+
+        switch (self->mState) {
+        case State::STARTING:
+          self->mState = State::RUNNING;
+          self->mTimer.async_wait(std::move(*this));
+          return;
+        case State::RUNNING:
+          run();
+          return;
+        case State::STOPPED:
+          self->mLog.info("Stopping FPS timer");
+          return;
+        }
+      }
+    };
+  public:
+    // Not thread safe
+    void tick() { mFrameCount++; }
+
+    // Not thread safe
+    void stop() { mState = State::STOPPED; }
+
+    // This is intended to live on a "coroutine stack" that lives for the
+    // duration of io_service::run
+    FPSTimer(
+      Logger &log, asio::io_service &asio
+    , asio::steady_timer::duration delta = std::chrono::seconds{5}
+    ) : mLog{log}, mTimer{asio, delta}, mFrameCount{0}, mDelta{delta}
+      , mThen{Clock::now()}, mState{State::STARTING}
+    { Worker{*this}(); }
+  };
+
   template <typename DrawCallback>
   class DrawRoutine final {
   private:
@@ -1225,6 +1305,7 @@ namespace {
     BorrowedDescriptor mDescriptor;
     std::optional<ActiveDisplay> mDisplay;
     DrawCallback mDrawCallback;
+    FPSTimer mFPS;
     State mState;
 
     DrawRoutine(
@@ -1245,6 +1326,7 @@ namespace {
         , mMode.width(), mMode.height(), mMode.crtc_id()
         )}
       , mDrawCallback{std::move(draw_callback)}
+      , mFPS{mLog, mASIO}
       , mState{State::MODE_SET}
     { /* No assertion, could be invalid */ }
 
@@ -1328,18 +1410,16 @@ namespace {
           } else {
             // Complete the flip
             self->mDisplay->finish_swap_buffers();
+            self->mFPS.tick();
 
             // We're not syncing other state here, just reading the value, so
             // memory_order_relaxed is fine. We do this here to let any pending
             // page flip complete before terminating.
             if (!self->mKeepRunning.load(std::memory_order_relaxed)) {
-              //using namespace std::chrono_literals;
-              //std::cout << std::this_thread::get_id() << " " << "Thread exiting due to external request" << std::endl;
               self->mLog.info("Ignoring exit request");
-              //std::this_thread::sleep_for(5s);
-              //std::cout << std::this_thread::get_id() << " " << "Thread exited due to external request" << std::endl;
-              //self->mState = State::STOPPED;
-              //return;
+              self->mState = State::STOPPED;
+              self->mFPS.stop();
+              return;
             }
 
             // Draw the next frame
@@ -1565,6 +1645,5 @@ int main() {
   //  //timer = std::nullopt;
   //});
   asio.run();
-  logger.info("FINI");
   return EXIT_SUCCESS;
 }
