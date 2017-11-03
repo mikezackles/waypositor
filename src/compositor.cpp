@@ -948,6 +948,10 @@ namespace {
       }
     };
 
+    // Note that this class assumes that the EGL_KHR_surfaceless_context
+    // extension is supported, and the context supports
+    // GL_OES_surfaceless_context. There is not currently any explicit check or
+    // fallback.
     class SurfacelessContext {
     private:
       Context mContext;
@@ -1046,13 +1050,14 @@ namespace {
 
     static std::optional<ActiveDisplay> create(
       Logger &log, gbm::Device const &gbm, egl::Display const &egl
+    , egl::SurfacelessContext const &master_context
     , uint32_t width, uint32_t height
     , uint32_t crtc_id // TODO - needed?
     ) {
       gbm::Surface gbm_surface{log, gbm, width, height};
       if (!gbm_surface) return std::nullopt;
 
-      auto context = egl::DrawableContext::create(log, egl, gbm_surface);
+      auto context = master_context.create_child_context(log, egl, gbm_surface);
       if (!context) return std::nullopt;
 
       return std::make_optional<ActiveDisplay>(
@@ -1314,6 +1319,7 @@ namespace {
     , std::atomic<bool> const &keep_running
     , asio::io_service &asio
     , GPU const &gpu
+    , egl::SurfacelessContext const &master_context
     , DisplayMode mode
     , DrawCallback draw_callback
     ) : mLog{log}
@@ -1323,7 +1329,7 @@ namespace {
       , mMode{std::move(mode)}
       , mDescriptor{asio, gpu.drm().get()}
       , mDisplay{ActiveDisplay::create(
-          log, mGPU.gbm(), mGPU.egl()
+          log, mGPU.gbm(), mGPU.egl(), master_context
         , mMode.width(), mMode.height(), mMode.crtc_id()
         )}
       , mDrawCallback{std::move(draw_callback)}
@@ -1442,11 +1448,12 @@ namespace {
     , std::atomic<bool> const &keep_running
     , asio::io_service &asio
     , GPU const &gpu
+    , egl::SurfacelessContext const &master_context
     , DisplayMode mode
     , DrawCallback draw_callback
     ) {
       DrawRoutine<DrawCallback> state{
-        log, keep_running, asio, gpu
+        log, keep_running, asio, gpu, master_context
       , std::move(mode), std::move(draw_callback)
       };
       if (!state) return;
@@ -1478,13 +1485,14 @@ namespace {
     DrawThread(
       Logger &log
     , GPU const &gpu
+    , egl::SurfacelessContext const &master_context
     , DisplayMode mode
     , DrawCallback draw_callback
     ) : mKeepRunning{true}
       , mASIO{}
       , mCrtcID{mode.crtc_id()}
       , mThread{[
-          this, &log, &gpu
+          this, &log, &gpu, &master_context
         , mode = std::move(mode)
         , draw_callback = std::move(draw_callback)
         ]() mutable {
@@ -1493,6 +1501,7 @@ namespace {
           , mKeepRunning
           , mASIO
           , gpu
+          , master_context
           , std::move(mode)
           , std::move(draw_callback)
           );
@@ -1508,6 +1517,7 @@ namespace {
   private:
     Logger *mLog;
     GPU mGPU;
+    egl::SurfacelessContext mMasterContext;
     // The keys here are connector ids returned from libdrm. The hope is that
     // they are consistent across reboots etc.
     std::map<uint32_t, DrawThread> mDisplayLookup;
@@ -1517,6 +1527,7 @@ namespace {
       Logger &log, GPU gpu, std::set<uint32_t> unused_crtcs
     ) : mLog{&log}
       , mGPU{std::move(gpu)}
+      , mMasterContext{egl::SurfacelessContext::create(*mLog, mGPU.egl())}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
     { assert(*this); }
@@ -1592,7 +1603,7 @@ namespace {
             std::piecewise_construct
           , std::forward_as_tuple(connector_id)
           , std::forward_as_tuple(
-              *mLog, mGPU, std::move(mode)
+              *mLog, mGPU, mMasterContext, std::move(mode)
             , [red, green, blue]() {
                 glClearColor(red, green, blue, 1.0);
                 glClear(GL_COLOR_BUFFER_BIT);
