@@ -122,7 +122,7 @@ bool draw_content(struct buffer *buffer)
         gbm_bo_get_height(buffer->bo),
         GBM_BO_TRANSFER_WRITE, &stride, &map_info));
     if (!map_info) {
-      fprintf(stderr, "map_bo failed %p\n", raw_data);
+      fprintf(stderr, "map_bo failed %p\n", (void *)raw_data);
       return false;
     }
     assert(raw_data);
