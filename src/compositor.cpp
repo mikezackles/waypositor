@@ -60,15 +60,10 @@ namespace {
     std::unordered_map<std::thread::id, std::string> mNameLookup;
     RAIIThread mThread;
 
-    template <bool flush, typename Message, typename ...Messages>
-    static void print_helper(
-      std::ostream &ostream
-    , Message &&message, Messages&&... messages
-    ) {
-      ostream << message;
-      if constexpr (sizeof...(messages) > 0) {
-        print_helper<flush>(ostream, messages...);
-      } else if (flush) {
+    template <bool flush, typename ...Messages>
+    static void print_helper(std::ostream &ostream, Messages&&... messages) {
+      (ostream << ... << messages);
+      if constexpr (flush) {
         ostream << std::endl;
       } else {
         ostream << "\n";
