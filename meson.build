@@ -1,11 +1,13 @@
 project(
-  'ob-compositor', 'cpp'
+  'ob-compositor', ['c', 'cpp']
 , default_options : [
     'cpp_std=c++1z'
   , 'werror=true'
   , 'warning_level=3'
   ]
 )
+
+c_compiler = meson.get_compiler('c')
 
 cpp_compiler = meson.get_compiler('cpp')
 maybe_cpp_flags = [
@@ -24,6 +26,7 @@ libdrm = dependency('libdrm', required : true)
 libgbm = dependency('gbm', required : true)
 libegl = dependency('egl', required : true)
 libgl = dependency('gl', required : true)
+libwayland_client = dependency('wayland-client', required : true)
 boost = dependency('boost', modules : ['system'], required : true)
 threads = dependency('threads', required : false)
 
@@ -37,3 +40,14 @@ executable(
 , cpp_args : cpp_flags
 )
 
+incdir = include_directories('protocol')
+
+executable(
+  'ob-client-dmabuf'
+, 'clients/client-dmabuf.cpp'
+, 'protocol/linux-dmabuf-unstable-v1-protocol.c'
+, include_directories : incdir
+, install: true
+, dependencies : [libdrm, libgbm, libwayland_client, threads]
+, cpp_args : cpp_flags
+)
