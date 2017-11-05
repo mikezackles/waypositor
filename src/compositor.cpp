@@ -1,6 +1,8 @@
+#include <waypositor/logger.hpp>
+#include <waypositor/detail/raiithread.hpp>
+
 #include <atomic>
 #include <chrono>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -32,118 +34,8 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
-namespace {
+namespace waypositor {
   namespace asio = boost::asio;
-
-  class RAIIThread {
-  private:
-    std::thread mThread;
-  public:
-    RAIIThread() = default;
-    template <typename ...Args>
-    RAIIThread(Args&&... args) : mThread{std::forward<Args>(args)...} {}
-    RAIIThread(RAIIThread const &) = delete;
-    RAIIThread &operator=(RAIIThread const &) = delete;
-    RAIIThread(RAIIThread &&) = default;
-    RAIIThread &operator=(RAIIThread &&) = default;
-    ~RAIIThread() { if (*this) mThread.join(); }
-
-    explicit operator bool() const { return mThread.joinable(); }
-    std::thread::id get_id() { return mThread.get_id(); }
-  };
-
-  class Logger final {
-  private:
-    asio::io_service mASIO;
-    std::optional<asio::io_service::work> mWork;
-    std::mutex mMutex;
-    std::unordered_map<std::thread::id, std::string> mNameLookup;
-    RAIIThread mThread;
-
-    template <bool flush, typename ...Messages>
-    static void print_helper(std::ostream &ostream, Messages&&... messages) {
-      (ostream << ... << messages);
-      if constexpr (flush) {
-        ostream << std::endl;
-      } else {
-        ostream << "\n";
-      }
-    }
-
-    // Should be synchronized by mMutex
-    std::string_view thread_name(std::thread::id id) {
-      using namespace std::string_view_literals;
-      if (auto it = mNameLookup.find(id); it != mNameLookup.end()) {
-        return {it->second};
-      } else {
-        return "???"sv;
-      }
-    }
-
-    void stop() { mASIO.post([this] { mWork = std::nullopt; }); }
-
-  public:
-    Logger(std::string main_thread_name)
-      : mASIO{}
-      , mWork{mASIO}
-      , mMutex{}
-      , mNameLookup{}
-      , mThread{[this] { mASIO.run(); }}
-    {
-      this->register_thread(
-        std::this_thread::get_id(), std::move(main_thread_name)
-      );
-    }
-    ~Logger() { this->stop(); }
-
-    void register_thread(std::thread::id id, std::string name) {
-      std::lock_guard lock{mMutex};
-      mNameLookup.emplace(id, std::move(name));
-    }
-
-    void unregister_thread(std::thread::id id) {
-      std::lock_guard lock{mMutex};
-      mNameLookup.erase(id);
-    }
-
-    // This is immediate. It's slower, but it shouldn't be running under normal
-    // operation. Error messages won't be lost in the event of a crash.
-    template <typename ...Messages>
-    void error(Messages&&... messages) {
-      std::lock_guard lock{mMutex};
-      print_helper<true>(
-        std::cerr, "[", thread_name(std::this_thread::get_id()), "] ", messages...
-      );
-    }
-
-    template <typename ...Messages>
-    void perror(Messages&&... messages) {
-      static constexpr std::size_t errno_buffer_size = 256;
-      char buffer[errno_buffer_size]{};
-      strerror_r(errno, buffer, errno_buffer_size);
-      this->error(messages..., ": ", buffer);
-    }
-
-    // This queues messages to run on the log thread.
-    template <typename ...Messages>
-    void info(Messages... messages) {
-      auto thread_id = std::this_thread::get_id();
-      mASIO.post([
-        this, thread_id = std::move(thread_id)
-      , messages = std::make_tuple(std::move(messages)...)
-      ]() {
-        std::apply(
-          [this, &thread_id](auto&&... messages_) {
-            std::lock_guard lock{mMutex};
-            print_helper<false>(
-              std::cout, "[", thread_name(thread_id), "] ", messages_...
-            );
-          }
-        , messages
-        );
-      });
-    }
-  };
 
   class FileDescriptor final {
   private:
@@ -1462,7 +1354,7 @@ namespace {
     std::atomic<bool> mKeepRunning;
     asio::io_service mASIO;
     uint32_t mCrtcID;
-    RAIIThread mThread;
+    detail::RAIIThread mThread;
   public:
     // Run something on the drawing thread
     template <typename Callback>
@@ -1622,8 +1514,8 @@ int main() {
   //asio::io_service asio{};
   //asio::steady_timer timer{asio, 5s};
   //asio::signal_set signals{asio, SIGINT, SIGTERM};
-  Logger logger{"Main"};
-  auto drm = DeviceManager::create(logger, "/dev/dri/card0");
+  waypositor::Logger logger{"Main"};
+  auto drm = waypositor::DeviceManager::create(logger, "/dev/dri/card0");
   if (!drm) return EXIT_FAILURE;
   drm.update_connections();
   //signals.async_wait([&](

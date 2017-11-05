@@ -13,7 +13,7 @@ cpp_compiler = meson.get_compiler('cpp')
 maybe_cpp_flags = [
   '-fmax-errors=3'
 , '-ferror-limit=3'
-, '-fvisibility=hidden'
+#, '-fvisibility=hidden'
 ]
 cpp_flags = []
 foreach flag : maybe_cpp_flags
@@ -33,8 +33,8 @@ threads = dependency('threads', required : false)
 executable(
   'ob-compositor'
 , 'src/compositor.cpp'
-, install: true
-#, include_directories : include
+, install : true
+, include_directories : include_directories('include')
 #, link_with : [liboblong_input]
 , dependencies : [libdrm, libgbm, libegl, libgl, boost, threads]
 , cpp_args : cpp_flags
@@ -47,7 +47,17 @@ executable(
 , 'clients/client-dmabuf.cpp'
 , 'protocol/linux-dmabuf-unstable-v1-protocol.c'
 , include_directories : incdir
-, install: true
+, install : true
 , dependencies : [libdrm, libgbm, libwayland_client, threads]
+, cpp_args : cpp_flags
+)
+
+# This is temporary so that we can deal with just the protocol until we need
+# graphics
+executable(
+  'protocol-server'
+, 'src/protocol-server.cpp'
+, install : true
+, dependencies : [boost, threads]
 , cpp_args : cpp_flags
 )
