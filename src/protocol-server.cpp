@@ -16,8 +16,12 @@ namespace waypositor {
 
   class Listener final {
   private:
+    enum class State { STOPPED, LISTENING, ACCEPTED };
     Logger &mLog;
+    asio::io_service &mAsio;
     Domain::acceptor mAcceptor;
+    Domain::socket mSocket;
+    State mState;
 
     class Worker final {
     private:
@@ -40,7 +44,22 @@ namespace waypositor {
       void operator()(boost::system::error_code const &error = {}) {
         assert(*this);
         if (error) {
-          self->mLog.error("ASIO error: ", error.message());
+          self->mLog.error("ASIO: ", error.message());
+          return;
+        }
+
+        switch (self->mState) {
+        case State::STOPPED:
+          self->mLog.info("Socket listener stopped by request");
+          return;
+        case State::LISTENING:
+          self->mState = State::ACCEPTED;
+          self->mAcceptor.async_accept(self->mSocket, std::move(*this));
+          return;
+        case State::ACCEPTED:
+          self->mLog.info("Connection accepted");
+          self->mState = State::LISTENING;
+          self->mAsio.post(std::move(*this));
           return;
         }
       }
@@ -52,10 +71,19 @@ namespace waypositor {
   public:
     void launch() { Worker{*this}(); }
 
+    void stop() {
+      mState = State::STOPPED;
+      boost::system::error_code error;
+      mAcceptor.cancel(error);
+      if (error) {
+        mLog.error("ASIO: ", error.message());
+      }
+    }
+
     Listener(
       Private // effectively make this constructor private
     , Logger &log, asio::io_service &asio, filesystem::path const &path
-    ) : mLog{log}, mAcceptor{asio, path.native()}
+    ) : mLog{log}, mAsio{asio}, mAcceptor{asio, path.native()}, mSocket{asio}
     {}
 
     template <typename Name>
