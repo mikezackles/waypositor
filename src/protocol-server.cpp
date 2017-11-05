@@ -8,6 +8,7 @@
 
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/local/stream_protocol.hpp>
+#include <boost/asio/signal_set.hpp>
 
 namespace waypositor {
   namespace filesystem = std::experimental::filesystem;
@@ -83,7 +84,9 @@ namespace waypositor {
     Listener(
       Private // effectively make this constructor private
     , Logger &log, asio::io_service &asio, filesystem::path const &path
-    ) : mLog{log}, mAsio{asio}, mAcceptor{asio, path.native()}, mSocket{asio}
+    ) : mLog{log}, mAsio{asio}
+      , mAcceptor{asio, path.native()}, mSocket{asio}
+      , mState{State::LISTENING}
     {}
 
     template <typename Name>
@@ -122,6 +125,18 @@ int main() {
   auto listener = Listener::create(log, asio, "wayland-0");
   if (!listener) return EXIT_FAILURE;
   listener->launch();
+
+  asio::signal_set signals{asio, SIGINT, SIGTERM};
+  signals.async_wait([&](
+    boost::system::error_code const &error, int /*signal*/
+  ) {
+    if (error) {
+      log.error("ASIO: ", error.message());
+      return;
+    }
+    listener->stop();
+  });
+
   asio.run();
   return EXIT_SUCCESS;
 }
