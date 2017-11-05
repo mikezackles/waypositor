@@ -58,6 +58,8 @@ executable(
   'protocol-server'
 , 'src/protocol-server.cpp'
 , install : true
+, include_directories : include_directories('include')
 , dependencies : [boost, threads]
 , cpp_args : cpp_flags
+, link_args : ['-lstdc++fs']
 )
