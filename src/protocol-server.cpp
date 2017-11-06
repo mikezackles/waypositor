@@ -126,7 +126,9 @@ namespace waypositor {
           boost::system::error_code const &error = {}, std::size_t = 0
         ) {
           if (error) {
-            self->mLog.error("ASIO: ", error.message());
+            self->mLog.error(
+              "(Connection ", self->mId, ") ASIO error: ", error.message()
+            );
             return;
           }
           auto lock = std::lock_guard(self->mMutex);
@@ -220,7 +222,7 @@ namespace waypositor {
       void operator()(boost::system::error_code const &error = {}) {
         assert(*this);
         if (error) {
-          self->mLog.error("ASIO: ", error.message());
+          self->mLog.error("(Listener) ASIO error: ", error.message());
           return;
         }
 
