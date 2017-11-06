@@ -1045,7 +1045,10 @@ namespace waypositor {
         int i = 0;
         for (uint32_t crtc_id : resources.crtcs()) {
           bool unused = available_crtcs.find(crtc_id) != available_crtcs.end();
-          if (encoder.has_crtc(i) && unused) return crtc_id;
+          if (encoder.has_crtc(i) && unused) {
+            log.info("Chose crtc ", crtc_id, " for encoder ", encoder.id());
+            return crtc_id;
+          }
           ++i;
         }
       }
@@ -1080,6 +1083,7 @@ namespace waypositor {
 
       log.info(
         "Found display ", *crtc_id, " at ", mode->hdisplay, "x", mode->vdisplay
+      , " for connector ", connector.id()
       );
 
       return {std::move(connector), mode, *crtc_id};
