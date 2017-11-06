@@ -20,26 +20,26 @@ namespace waypositor {
 
   class Parser {
   private:
-    enum class State { OBJECT_ID, MESSAGE_SIZE, OPCODE, FINISHED };
+    enum class State { OBJECT_ID, OPCODE, MESSAGE_SIZE, FINISHED };
     uint32_t mObjectId;
-    uint16_t mMessageSize;
     uint16_t mOpcode;
+    uint16_t mMessageSize;
     State mState{State::OBJECT_ID};
   public:
     template <typename AsyncRead>
     void resume(Logger &log, AsyncRead async_read) {
       switch (mState) {
       case State::OBJECT_ID:
-        mState = State::MESSAGE_SIZE;
+        mState = State::OPCODE;
         async_read(asio::buffer(&mObjectId, sizeof(uint32_t)));
         return;
-      case State::MESSAGE_SIZE:
-        mState = State::OPCODE;
-        async_read(asio::buffer(&mMessageSize, sizeof(uint16_t)));
-        return;
       case State::OPCODE:
-        mState = State::FINISHED;
+        mState = State::MESSAGE_SIZE;
         async_read(asio::buffer(&mOpcode, sizeof(uint16_t)));
+        return;
+      case State::MESSAGE_SIZE:
+        mState = State::FINISHED;
+        async_read(asio::buffer(&mMessageSize, sizeof(uint16_t)));
         return;
       case State::FINISHED:
         log.info(
