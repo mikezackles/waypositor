@@ -319,52 +319,6 @@ namespace waypositor {
       std::atomic<uint32_t> crtc_id;
       bool flip_is_pending;
     };
-
-    // Holds a reference to flip_data
-    bool begin_page_flip(
-      Logger &log, Descriptor const &gpu, FrameBuffer const &framebuffer
-    , uint32_t crtc_id, FlipData &flip_data
-    ) {
-      int error = drmModePageFlip(
-        gpu.get(), crtc_id, framebuffer.get()
-      , DRM_MODE_PAGE_FLIP_EVENT, &flip_data
-      );
-      if (error) {
-        log.perror("Page flip failed");
-        return false;
-      } else {
-        flip_data.flip_is_pending = true;
-        return true;
-      }
-    }
-
-    namespace detail {
-      void mark_flip_no_longer_pending(
-        int /*gpu descriptor*/
-      , unsigned int /*frame*/
-      , unsigned int /*seconds*/
-      , unsigned int /*microseconds*/
-      , unsigned int crtc_id
-      , void *user_data
-      ) {
-        auto flip_data = static_cast<FlipData *>(user_data);
-        assert(flip_data != nullptr);
-        if (crtc_id == flip_data->crtc_id) {
-          flip_data->flip_is_pending = false;
-        }
-      }
-      drmEventContext make_event_context() {
-        drmEventContext context;
-        context.version = 3;
-        context.page_flip_handler2 = &mark_flip_no_longer_pending;
-        return context;
-      }
-    }
-
-    bool handle_event(Descriptor const &gpu) {
-      static drmEventContext context = detail::make_event_context();
-      return drmHandleEvent(gpu.get(), &context);
-    }
   }
 
   namespace gbm {
@@ -919,9 +873,9 @@ namespace waypositor {
     std::thread::id mThreadID;
     gbm::Surface mSurface;
     egl::DrawableContext mEGL;
-    drm::FlipData mFlipData;
     gbm::FrontBuffer mCurrentFrontBuffer;
     gbm::FrontBuffer mNextFrontBuffer;
+    uint32_t mCrtcId;
 
   public:
     ActiveDisplay(
@@ -931,8 +885,8 @@ namespace waypositor {
     ) : mThreadID{std::this_thread::get_id()}
       , mSurface{std::move(gbm_surface)}
       , mEGL{std::move(context)}
-      , mFlipData{crtc_id, false}
       , mCurrentFrontBuffer{}, mNextFrontBuffer{}
+      , mCrtcId{crtc_id}
     { assert(*this); }
 
     static std::optional<ActiveDisplay> create(
@@ -957,7 +911,7 @@ namespace waypositor {
       return (std::this_thread::get_id() == mThreadID) && mSurface && mEGL;
     }
 
-    uint32_t crtc_id() const { assert(*this); return mFlipData.crtc_id; }
+    uint32_t crtc_id() const { assert(*this); return mCrtcId; }
 
     bool set_mode(
       Logger &log
@@ -975,7 +929,7 @@ namespace waypositor {
       auto framebuffer = front.ensure_framebuffer(log, gpu);
       if (!framebuffer) return false;
       if (drm::set_mode(
-        log, gpu, *framebuffer, connector_id, mFlipData.crtc_id, mode
+        log, gpu, *framebuffer, connector_id, mCrtcId, mode
       )) {
         mCurrentFrontBuffer = std::move(front);
         return true;
@@ -988,6 +942,7 @@ namespace waypositor {
       Logger &log
     , drm::Descriptor const &gpu
     , egl::Display const &egl_display
+    , void *user_data
     ) {
       assert(*this && mCurrentFrontBuffer);
       mEGL.swap_buffers(egl_display);
@@ -995,25 +950,17 @@ namespace waypositor {
       if (!front) return false;
       auto framebuffer = mCurrentFrontBuffer.ensure_framebuffer(log, gpu);
       if (!framebuffer) return false;
-      bool success = drm::begin_page_flip(
-        log, gpu, *framebuffer, mFlipData.crtc_id, mFlipData
+      bool error = drmModePageFlip(
+        gpu.get(), mCrtcId, framebuffer->get()
+      , DRM_MODE_PAGE_FLIP_EVENT, user_data
       );
-      if (success) mNextFrontBuffer = std::move(front);
-      return success;
-    }
-
-    bool buffer_swap_is_pending() const {
-      assert(*this);
-      return mFlipData.flip_is_pending;
-    }
-
-    bool handle_event(drm::Descriptor const &gpu) {
-      assert(*this && mFlipData.flip_is_pending);
-      return drm::handle_event(gpu);
+      if (error) return false;
+      mNextFrontBuffer = std::move(front);
+      return true;
     }
 
     void finish_swap_buffers() {
-      assert(*this && !mFlipData.flip_is_pending);
+      assert(*this);
       mCurrentFrontBuffer = std::move(mNextFrontBuffer);
     }
   };
@@ -1170,44 +1117,8 @@ namespace waypositor {
     { Worker{*this}(); }
   };
 
-  template <typename DrawCallback>
   class DrawRoutine final {
   private:
-    enum class State { MODE_SET, DRAWING, PAGE_FLIP, STOPPED };
-    Logger &mLog;
-    std::atomic<bool> const &mKeepRunning;
-    asio::io_service &mASIO;
-    GPU const &mGPU;
-    DisplayMode mMode;
-    asio::posix::stream_descriptor mDescriptor;
-    std::optional<ActiveDisplay> mDisplay;
-    DrawCallback mDrawCallback;
-    FPSTimer mFPS;
-    State mState;
-
-    DrawRoutine(
-      Logger &log
-    , std::atomic<bool> const &keep_running
-    , asio::io_service &asio
-    , GPU const &gpu
-    , egl::SurfacelessContext const &master_context
-    , DisplayMode mode
-    , DrawCallback draw_callback
-    ) : mLog{log}
-      , mKeepRunning{keep_running}
-      , mASIO{asio}
-      , mGPU{gpu}
-      , mMode{std::move(mode)}
-      , mDescriptor{asio, ::dup(gpu.drm().get())}
-      , mDisplay{ActiveDisplay::create(
-          log, mGPU.gbm(), mGPU.egl(), master_context
-        , mMode.width(), mMode.height(), mMode.crtc_id()
-        )}
-      , mDrawCallback{std::move(draw_callback)}
-      , mFPS{mLog, mASIO}
-      , mState{State::MODE_SET}
-    { /* No assertion, could be invalid */ }
-
     class Worker final {
     private:
       DrawRoutine *self;
@@ -1245,8 +1156,6 @@ namespace waypositor {
         }
 
         switch (self->mState) {
-        case State::STOPPED:
-          assert(false);
         case State::MODE_SET:
           if (!self->mDisplay->set_mode(
             self->mLog
@@ -1256,75 +1165,128 @@ namespace waypositor {
             self->mLog.error("Thread exiting due to error");
             return;
           }
+
           self->mState = State::DRAWING;
           self->mASIO.post(std::move(*this));
           return;
+        case State::PAGE_FLIP:
+          // Complete the flip
+          self->mDisplay->finish_swap_buffers();
+          self->mFPS.tick();
+
+          // It's important that we do this when no page flip is pending. Due to
+          // the nature of the drm API, references to this DrawRoutine are
+          // loaned to the event dispatch thread during page flip. See
+          // DrawRoutine::handle_event
+          if (!self->mKeepRunning) {
+            self->mLog.info("Thread exiting due to request");
+            self->mFPS.stop();
+            self->mWork = std::nullopt;
+            return;
+          }
+
+          // Fall through
         case State::DRAWING:
           // Do the drawing
-          //self->mLog.info("Draw");
           self->mDrawCallback();
 
           // Begin the flip
           if (!self->mDisplay->begin_swap_buffers(
-            self->mLog, self->mGPU.drm(), self->mGPU.egl()
+            self->mLog, self->mGPU.drm(), self->mGPU.egl(), self
           )) {
             self->mLog.error("Thread exiting due to error");
             return;
           }
-          // Wait for the flip
+
+          // Pause the worker until the flip happens. This io_service is
+          // single-threaded, so this can happen after beginning the flip
           self->mState = State::PAGE_FLIP;
-          asio::async_read(
-            self->mDescriptor, asio::null_buffers(), std::move(*this)
-          );
+          self->mDormantWorker = std::move(*this);
           return;
-        case State::PAGE_FLIP:
-          self->mDisplay->handle_event(self->mGPU.drm());
-          if (self->mDisplay->buffer_swap_is_pending()) {
-            // Keep waiting
-            asio::async_read(
-              self->mDescriptor, asio::null_buffers(), std::move(*this)
-            );
-            return;
-          } else {
-            // Complete the flip
-            self->mDisplay->finish_swap_buffers();
-            self->mFPS.tick();
-
-            // We're not syncing other state here, just reading the value, so
-            // memory_order_relaxed is fine. We do this here to let any pending
-            // page flip complete before terminating.
-            if (!self->mKeepRunning.load(std::memory_order_relaxed)) {
-              self->mLog.info("Thread exiting due to external request");
-              self->mState = State::STOPPED;
-              self->mFPS.stop();
-              return;
-            }
-
-            // Draw the next frame
-            self->mState = State::DRAWING;
-            self->mASIO.post(std::move(*this));
-            return;
-          }
         }
       }
     };
 
+    enum class State { MODE_SET, DRAWING, PAGE_FLIP };
+    Logger &mLog;
+    asio::io_service &mASIO;
+    std::atomic<bool> const &mKeepRunning;
+    std::optional<asio::io_service::work> mWork;
+    GPU const &mGPU;
+    DisplayMode mMode;
+    std::optional<ActiveDisplay> mDisplay;
+    std::function<void()> mDrawCallback;
+    FPSTimer mFPS;
+    State mState;
+    std::optional<Worker> mDormantWorker;
+
+    DrawRoutine(
+      Logger &log
+    , asio::io_service &asio
+    , std::atomic<bool> const &keep_running
+    , GPU const &gpu
+    , egl::SurfacelessContext const &master_context
+    , DisplayMode mode
+    , std::function<void()> draw_callback
+    ) : mLog{log}
+      , mASIO{asio}
+      , mKeepRunning{keep_running}
+      , mWork{std::make_optional<asio::io_service::work>(asio)}
+      , mGPU{gpu}
+      , mMode{std::move(mode)}
+      , mDisplay{ActiveDisplay::create(
+          log, mGPU.gbm(), mGPU.egl(), master_context
+        , mMode.width(), mMode.height(), mMode.crtc_id()
+        )}
+      , mDrawCallback{std::move(draw_callback)}
+      , mFPS{mLog, mASIO}
+      , mState{State::MODE_SET}
+      , mDormantWorker{std::nullopt}
+    { /* No assertion, could be invalid */ }
+
+    static void drm_event_callback(
+      int /*gpu descriptor*/
+    , unsigned int /*frame*/
+    , unsigned int /*seconds*/
+    , unsigned int /*microseconds*/
+    , void *user_data
+    ) {
+      auto self = static_cast<DrawRoutine *>(user_data);
+      assert(self != nullptr);
+      self->mASIO.post([self]() {
+        // Restart the worker
+        self->mASIO.dispatch(std::move(*self->mDormantWorker));
+      });
+    }
+
+    static drmEventContext make_event_context() {
+      drmEventContext context;
+      context.version = 3;
+      context.page_flip_handler = &drm_event_callback;
+      return context;
+    }
+
   public:
+    static bool handle_event(drm::Descriptor const &drm) {
+      static drmEventContext context = make_event_context();
+      return drmHandleEvent(drm.get(), &context) == 0;
+    }
+
     explicit operator bool() const {
       return static_cast<bool>(mDisplay);
     }
 
     static void begin(
       Logger &log
-    , std::atomic<bool> const &keep_running
     , asio::io_service &asio
+    , std::atomic<bool> const &keep_running
     , GPU const &gpu
     , egl::SurfacelessContext const &master_context
     , DisplayMode mode
-    , DrawCallback draw_callback
+    , std::function<void()> draw_callback
     ) {
-      DrawRoutine<DrawCallback> state{
-        log, keep_running, asio, gpu, master_context
+      DrawRoutine state{
+        log, asio, keep_running, gpu, master_context
       , std::move(mode), std::move(draw_callback)
       };
       if (!state) return;
@@ -1335,8 +1297,8 @@ namespace waypositor {
 
   class DrawThread final {
   private:
-    std::atomic<bool> mKeepRunning;
     asio::io_service mASIO;
+    std::atomic<bool> mKeepRunning;
     uint32_t mCrtcID;
     detail::RAIIThread mThread;
   public:
@@ -1352,25 +1314,24 @@ namespace waypositor {
 
     explicit operator bool() const { return static_cast<bool>(mThread); }
 
-    template <typename DrawCallback>
     DrawThread(
       Logger &log
     , GPU const &gpu
     , egl::SurfacelessContext const &master_context
     , DisplayMode mode
-    , DrawCallback draw_callback
-    ) : mKeepRunning{true}
-      , mASIO{}
+    , std::function<void()> draw_callback
+    ) : mASIO{}
+      , mKeepRunning{true}
       , mCrtcID{mode.crtc_id()}
       , mThread{[
           this, &log, &gpu, &master_context
         , mode = std::move(mode)
         , draw_callback = std::move(draw_callback)
         ]() mutable {
-          DrawRoutine<DrawCallback>::begin(
+          DrawRoutine::begin(
             log
-          , mKeepRunning
           , mASIO
+          , mKeepRunning
           , gpu
           , master_context
           , std::move(mode)
@@ -1387,53 +1348,49 @@ namespace waypositor {
   class DeviceManager final {
   private:
     Logger *mLog;
-    GPU mGPU;
+    GPU const &mGPU;
     egl::SurfacelessContext mMasterContext;
     // The keys here are connector ids returned from libdrm. The hope is that
     // they are consistent across reboots etc.
     std::map<uint32_t, DrawThread> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
+    struct Private {};
+  public:
     DeviceManager(
-      Logger &log, GPU gpu, std::set<uint32_t> unused_crtcs
+      Private, Logger &log, GPU const &gpu, std::set<uint32_t> unused_crtcs
     ) : mLog{&log}
-      , mGPU{std::move(gpu)}
+      , mGPU{gpu}
       , mMasterContext{egl::SurfacelessContext::create(*mLog, mGPU.egl())}
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
     { assert(*this); }
 
-  public:
-    DeviceManager() = default;
-
-    // Keeps a reference to the logger!
-    static DeviceManager create(Logger &log, char const *path) {
-      // TODO
-      auto gpu = GPU::create(log, path);
-      if (!gpu) return {};
-
+    static std::optional<DeviceManager> create(Logger &log, GPU const &gpu) {
       drm::Resources resources{log, gpu.drm()};
-      if (!resources) return {};
+      if (!resources) return std::nullopt;
 
       std::set<uint32_t> unused_crtcs{};
       for (uint32_t crtc_id : resources.crtcs()) unused_crtcs.insert(crtc_id);
 
-      return {log, std::move(gpu), std::move(unused_crtcs)};
+      return std::make_optional<DeviceManager>(
+        Private{}, log, std::move(gpu), std::move(unused_crtcs)
+      );
     }
 
     explicit operator bool() const {
       return (mLog != nullptr) && mGPU;
     }
 
+    static bool handle_event(drm::Descriptor const &drm) {
+      return DrawRoutine::handle_event(drm);
+    }
+
     void stop_threads() {
       assert(*this);
-      //int i = 0;
       for (auto &pair : mDisplayLookup) {
-        //if (i == 0) {
         DrawThread &thread = pair.second;
         thread.stop();
-        //}
-        //i++;
       }
     }
 
@@ -1491,17 +1448,87 @@ namespace waypositor {
       }
     }
   };
+
+  class EventDispatcher final {
+  private:
+    enum class State { WAITING, GOT_EVENT };
+    Logger &mLog;
+    drm::Descriptor const &mDrm;
+    std::optional<asio::posix::stream_descriptor> mDescriptor;
+    State mState;
+
+    class Worker {
+    private:
+      EventDispatcher *self;
+    public:
+      Worker(Worker const &);
+      Worker &operator=(Worker const &);
+      Worker(Worker &&other) noexcept : self{other.self}
+      { other.self = nullptr; }
+      Worker &operator=(Worker &&other) {
+        if (this == &other) return *this;
+        self = other.self;
+        other.self = nullptr;
+        return *this;
+      }
+      ~Worker() = default;
+
+      Worker(EventDispatcher &self_) : self{&self_} {}
+
+      void operator()(
+        boost::system::error_code const &error = {}, std::size_t = 0
+      ) {
+        assert(*this);
+        if (error) {
+          self->mLog.error("ASIO error: ", error.message());
+          return;
+        }
+
+        switch (self->mState) {
+        case State::GOT_EVENT:
+          DrawRoutine::handle_event(self->mDrm);
+          // Fall through
+        case State::WAITING:
+          self->mState = State::GOT_EVENT;
+          asio::async_read(
+            *self->mDescriptor, asio::null_buffers(), std::move(*this)
+          );
+          return;
+        }
+      }
+
+      explicit operator bool() const { return self != nullptr; }
+    };
+  public:
+    void stop() { mDescriptor = std::nullopt; }
+
+    EventDispatcher(
+      Logger &log, asio::io_service &asio, drm::Descriptor const &drm
+    ) : mLog{log}, mDrm{drm}
+      , mDescriptor{std::make_optional<asio::posix::stream_descriptor>(
+          asio, ::dup(drm.get())
+        )}
+      , mState{State::WAITING}
+    { Worker{*this}(); }
+  };
 }
 
 int main() {
-  //using namespace std::chrono_literals;
-  //asio::io_service asio{};
-  //asio::steady_timer timer{asio, 5s};
+  using namespace waypositor;
+  using namespace std::chrono_literals;
+  asio::io_service asio{};
+  asio::steady_timer timer{asio, 15s};
   //asio::signal_set signals{asio, SIGINT, SIGTERM};
-  waypositor::Logger logger{"Main"};
-  auto drm = waypositor::DeviceManager::create(logger, "/dev/dri/card0");
-  if (!drm) return EXIT_FAILURE;
-  drm.update_connections();
+  Logger logger{"Main"};
+  auto gpu = GPU::create(logger, "/dev/dri/card0");
+  if (!gpu) return EXIT_FAILURE;
+
+  EventDispatcher dispatcher{logger, asio, gpu.drm()};
+
+  auto device_manager = DeviceManager::create(logger, gpu);
+  if (!device_manager) return EXIT_FAILURE;
+
+  device_manager->update_connections();
   //signals.async_wait([&](
   //  boost::system::error_code const &error, int /*signal*/
   //) {
@@ -1511,16 +1538,16 @@ int main() {
   //  }
   //  drm.stop_threads();
   //});
-  //timer.async_wait([&](
-  //  boost::system::error_code const &error
-  //) {
-  //  if (error) {
-  //    logger.error("Problem with timer");
-  //    return;
-  //  }
-  //  drm.stop_threads();
-  //  logger.info("HI");
-  //});
-  //asio.run();
+  timer.async_wait([&](
+    boost::system::error_code const &error
+  ) {
+    if (error) {
+      logger.error("Problem with timer");
+      return;
+    }
+    device_manager->stop_threads();
+    dispatcher.stop();
+  });
+  asio.run();
   return EXIT_SUCCESS;
 }
