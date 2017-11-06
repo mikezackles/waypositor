@@ -1173,33 +1173,13 @@ namespace waypositor {
   template <typename DrawCallback>
   class DrawRoutine final {
   private:
-    class BorrowedDescriptor {
-    private:
-      asio::posix::stream_descriptor mDescriptor;
-    public:
-      template <typename ...Args>
-      BorrowedDescriptor(Args&&... args)
-        : mDescriptor{std::forward<Args>(args)...}
-      {}
-      ~BorrowedDescriptor() {
-        if (mDescriptor.is_open()) mDescriptor.release();
-      }
-
-      asio::posix::stream_descriptor &get() {
-        assert(mDescriptor.is_open());
-        return mDescriptor;
-      }
-
-      void cancel() { mDescriptor.cancel(); }
-    };
-
     enum class State { MODE_SET, DRAWING, PAGE_FLIP, STOPPED };
     Logger &mLog;
     std::atomic<bool> const &mKeepRunning;
     asio::io_service &mASIO;
     GPU const &mGPU;
     DisplayMode mMode;
-    BorrowedDescriptor mDescriptor;
+    asio::posix::stream_descriptor mDescriptor;
     std::optional<ActiveDisplay> mDisplay;
     DrawCallback mDrawCallback;
     FPSTimer mFPS;
@@ -1218,7 +1198,7 @@ namespace waypositor {
       , mASIO{asio}
       , mGPU{gpu}
       , mMode{std::move(mode)}
-      , mDescriptor{asio, gpu.drm().get()}
+      , mDescriptor{asio, ::dup(gpu.drm().get())}
       , mDisplay{ActiveDisplay::create(
           log, mGPU.gbm(), mGPU.egl(), master_context
         , mMode.width(), mMode.height(), mMode.crtc_id()
@@ -1294,7 +1274,7 @@ namespace waypositor {
           // Wait for the flip
           self->mState = State::PAGE_FLIP;
           asio::async_read(
-            self->mDescriptor.get(), asio::null_buffers(), std::move(*this)
+            self->mDescriptor, asio::null_buffers(), std::move(*this)
           );
           return;
         case State::PAGE_FLIP:
@@ -1302,7 +1282,7 @@ namespace waypositor {
           if (self->mDisplay->buffer_swap_is_pending()) {
             // Keep waiting
             asio::async_read(
-              self->mDescriptor.get(), asio::null_buffers(), std::move(*this)
+              self->mDescriptor, asio::null_buffers(), std::move(*this)
             );
             return;
           } else {
