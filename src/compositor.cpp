@@ -993,7 +993,7 @@ namespace waypositor {
       mEGL.swap_buffers(egl_display);
       auto front = mSurface.lock_front_buffer(log);
       if (!front) return false;
-      auto framebuffer = front.ensure_framebuffer(log, gpu);
+      auto framebuffer = mCurrentFrontBuffer.ensure_framebuffer(log, gpu);
       if (!framebuffer) return false;
       bool success = drm::begin_page_flip(
         log, gpu, *framebuffer, mFlipData.crtc_id, mFlipData
