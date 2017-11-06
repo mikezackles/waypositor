@@ -18,16 +18,15 @@ namespace waypositor {
   namespace asio = boost::asio;
   using Domain = asio::local::stream_protocol;
 
-  // This is pretty complex to support shutting down the server cleanly. There
-  // might be a simpler way. It's currently thread safe, but I don't see why
-  // we'd ever need more than one thread for this.
+  // This is pretty complex in order to support shutting down the server
+  // cleanly. There might be a simpler way. It's currently thread safe, but I
+  // don't see why we'd ever need more than one thread for this.
   class Registry final {
   private:
     class Connection final {
     private:
       Logger &mLog;
       Registry &mOwner;
-      std::size_t mId;
       std::mutex mMutex;
       std::optional<Domain::socket> mSocket;
 
@@ -40,7 +39,7 @@ namespace waypositor {
         Worker(Worker &&other) = default;
         Worker &operator=(Worker &&other) = default;
         ~Worker() {
-          if (self) self->mOwner.mLookup.erase(self->mId);
+          if (self) self->mOwner.mLookup.erase(self.get());
         }
 
         Worker(std::shared_ptr<Connection> self_) : self{std::move(self_)} {}
@@ -72,8 +71,8 @@ namespace waypositor {
     public:
       Connection(
         Private // make it effectively private
-      , Logger &log, Registry &owner, std::size_t id, Domain::socket socket
-      ) : mLog{log}, mOwner{owner}, mId{id}
+      , Logger &log, Registry &owner, Domain::socket socket
+      ) : mLog{log}, mOwner{owner}
         , mMutex{}, mSocket{std::move(socket)}
       {}
 
@@ -94,35 +93,36 @@ namespace waypositor {
         Handle &operator=(Handle &&) = default;
         ~Handle() { mHandle->close(); }
 
+        Connection *get() { return mHandle.get(); }
+
         Handle(std::shared_ptr<Connection> handle)
           : mHandle{std::move(handle)}
         {}
       };
 
       static Handle create(
-        Logger &log, Registry &owner, std::size_t id, Domain::socket socket
+        Logger &log, Registry &owner, Domain::socket socket
       ) {
         auto pointer = std::make_shared<Connection>(
-          Private{}, log, owner, id, std::move(socket)
+          Private{}, log, owner, std::move(socket)
         );
         Worker{pointer}();
         return {std::move(pointer)};
       }
     };
 
-    std::unordered_map<std::size_t, Connection::Handle> mLookup;
-    std::size_t mCurrentId;
+    std::unordered_map<Connection *, Connection::Handle> mLookup;
   public:
     void connect(
       Logger &log, Domain::socket socket
     ) {
-      mLookup.emplace(mCurrentId, Connection::create(
-        log, *this, mCurrentId, std::move(socket)
-      ));
-      mCurrentId++;
+      auto handle = Connection::create(
+        log, *this, std::move(socket)
+      );
+      mLookup.emplace(handle.get(), std::move(handle));
     }
 
-    Registry() : mLookup{}, mCurrentId{0} {}
+    Registry() = default;
   };
 
   class Listener final {
