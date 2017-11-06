@@ -131,7 +131,7 @@ namespace waypositor {
         Handle &operator=(Handle const &);
         Handle(Handle &&) = default;
         Handle &operator=(Handle &&) = default;
-        ~Handle() { mHandle->close(); }
+        ~Handle() { if (mHandle) mHandle->close(); }
 
         Connection *get() { return mHandle.get(); }
 
