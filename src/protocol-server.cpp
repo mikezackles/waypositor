@@ -26,20 +26,20 @@ namespace waypositor {
     uint16_t mMessageSize;
     State mState{State::OBJECT_ID};
   public:
-    template <typename AsyncRead, typename Suspend>
-    void resume(Logger &log, AsyncRead async_read, Suspend suspend) {
+    template <typename Continuer>
+    void resume(Logger &log, Continuer continuer) {
       switch (mState) {
       case State::OBJECT_ID:
         mState = State::OPCODE;
-        async_read(asio::buffer(&mObjectId, sizeof(uint32_t)));
+        continuer.async_read(asio::buffer(&mObjectId, sizeof(uint32_t)));
         return;
       case State::OPCODE:
         mState = State::MESSAGE_SIZE;
-        async_read(asio::buffer(&mOpcode, sizeof(uint16_t)));
+        continuer.async_read(asio::buffer(&mOpcode, sizeof(uint16_t)));
         return;
       case State::MESSAGE_SIZE:
         mState = State::FINISHED;
-        async_read(asio::buffer(&mMessageSize, sizeof(uint16_t)));
+        continuer.async_read(asio::buffer(&mMessageSize, sizeof(uint16_t)));
         return;
       case State::FINISHED:
         log.info("Finished parsing header");
@@ -47,7 +47,7 @@ namespace waypositor {
         log.info("Message Size: ", mMessageSize);
         log.info("Opcode: ", mOpcode);
         mState = State::OBJECT_ID;
-        suspend();
+        continuer.suspend();
         return;
       }
     }
@@ -67,6 +67,24 @@ namespace waypositor {
       std::mutex mMutex;
       std::optional<Domain::socket> mSocket;
       Parser mParser;
+
+      class Continuer final {
+      private:
+        std::shared_ptr<Connection> self;
+      public:
+        template <typename Buffers>
+        void async_read(Buffers &&buffers) {
+          asio::async_read(*self->mSocket, buffers, Worker{std::move(self)});
+        }
+
+        void suspend() {
+          self->mAsio.post(Worker{std::move(self)});
+        }
+
+        Continuer(std::shared_ptr<Connection> &&self_)
+          : self{std::move(self_)}
+        {}
+      };
 
       class Worker final {
       private:
@@ -97,13 +115,7 @@ namespace waypositor {
             return;
           }
 
-          self->mParser.resume(
-            self->mLog
-          , [this](auto &&buffers) {
-              asio::async_read(*self->mSocket, buffers, std::move(*this));
-            }
-          , [this] { self->mAsio.post(std::move(*this)); }
-          );
+          self->mParser.resume(self->mLog, Continuer{std::move(self)});
         }
 
         explicit operator bool() const { return self != nullptr; }
