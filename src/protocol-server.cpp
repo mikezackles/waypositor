@@ -4,16 +4,126 @@
 
 #include <optional>
 #include <system_error>
+#include <unordered_map>
 #include <experimental/filesystem>
 
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/local/stream_protocol.hpp>
+#include <boost/asio/read.hpp>
 #include <boost/asio/signal_set.hpp>
 
 namespace waypositor {
   namespace filesystem = std::experimental::filesystem;
   namespace asio = boost::asio;
   using Domain = asio::local::stream_protocol;
+
+  // This is pretty complex to support shutting down the server cleanly. There
+  // might be a simpler way. It's currently thread safe, but I don't see why
+  // we'd ever need more than one thread for this.
+  class Registry final {
+  private:
+    class Connection final {
+    private:
+      Logger &mLog;
+      Registry &mOwner;
+      std::size_t mId;
+      std::mutex mMutex;
+      std::optional<Domain::socket> mSocket;
+
+      class Worker final {
+      private:
+        std::shared_ptr<Connection> self;
+      public:
+        Worker(Worker const &);
+        Worker &operator=(Worker const &);
+        Worker(Worker &&other) = default;
+        Worker &operator=(Worker &&other) = default;
+        ~Worker() {
+          if (self) self->mOwner.mLookup.erase(self->mId);
+        }
+
+        Worker(std::shared_ptr<Connection> self_) : self{std::move(self_)} {}
+
+        void operator()(
+          boost::system::error_code const &error = {}, std::size_t = 0
+        ) {
+          if (error) {
+            self->mLog.error("ASIO: ", error.message());
+            return;
+          }
+          auto lock = std::lock_guard(self->mMutex);
+          if (!self->mSocket) {
+            self->mLog.info(
+              "Connection worker exiting due to connection closure"
+            );
+            return;
+          }
+
+          asio::async_read(
+            *self->mSocket, asio::null_buffers(), std::move(*this)
+          );
+        }
+
+        explicit operator bool() const { return self != nullptr; }
+      };
+
+      struct Private {};
+    public:
+      Connection(
+        Private // make it effectively private
+      , Logger &log, Registry &owner, std::size_t id, Domain::socket socket
+      ) : mLog{log}, mOwner{owner}, mId{id}
+        , mMutex{}, mSocket{std::move(socket)}
+      {}
+
+      void close() {
+        auto lock = std::lock_guard(mMutex);
+        mSocket = std::nullopt;
+      }
+
+      class Handle {
+      private:
+        std::shared_ptr<Connection> mHandle;
+      public:
+        // These should be deleted, but there was a bug in gcc:
+        // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80654
+        Handle(Handle const &);
+        Handle &operator=(Handle const &);
+        Handle(Handle &&) = default;
+        Handle &operator=(Handle &&) = default;
+        ~Handle() { mHandle->close(); }
+
+        Handle(std::shared_ptr<Connection> handle)
+          : mHandle{std::move(handle)}
+        {}
+      };
+
+      static Handle create(
+        Logger &log, Registry &owner, std::size_t id, Domain::socket socket
+      ) {
+        auto pointer = std::make_shared<Connection>(
+          Private{}, log, owner, id, std::move(socket)
+        );
+        Worker{pointer}();
+        return {std::move(pointer)};
+      }
+    };
+
+    std::unordered_map<std::size_t, Connection::Handle> mLookup;
+    std::size_t mCurrentId;
+  public:
+    void connect(
+      Logger &log, Domain::socket socket
+    ) {
+      mLookup.emplace(mCurrentId, Connection::create(
+        log, *this, mCurrentId, std::move(socket)
+      ));
+      mCurrentId++;
+    }
+
+    Registry() : mLookup{}, mCurrentId{0} {}
+  };
 
   class Listener final {
   private:
@@ -22,6 +132,7 @@ namespace waypositor {
     asio::io_service &mAsio;
     Domain::acceptor mAcceptor;
     Domain::socket mSocket;
+    std::optional<Registry> mConnections;
     State mState;
 
     class Worker final {
@@ -59,13 +170,14 @@ namespace waypositor {
           return;
         case State::ACCEPTED:
           self->mLog.info("Connection accepted");
+          self->mConnections->connect(self->mLog, std::move(self->mSocket));
           self->mState = State::LISTENING;
           self->mAsio.post(std::move(*this));
           return;
         }
       }
 
-      explicit operator bool() const { return self != nullptr; }
+      explicit operator bool() const { return self != nullptr && *self; }
     };
 
     struct Private {};
@@ -74,6 +186,8 @@ namespace waypositor {
 
     void stop() {
       mState = State::STOPPED;
+      mConnections = std::nullopt;
+
       boost::system::error_code error;
       mAcceptor.cancel(error);
       if (error) {
@@ -81,11 +195,16 @@ namespace waypositor {
       }
     }
 
+    explicit operator bool() const {
+      return mState == State::STOPPED || static_cast<bool>(mConnections);
+    }
+
     Listener(
       Private // effectively make this constructor private
     , Logger &log, asio::io_service &asio, filesystem::path const &path
     ) : mLog{log}, mAsio{asio}
       , mAcceptor{asio, path.native()}, mSocket{asio}
+      , mConnections{std::make_optional<Registry>()}
       , mState{State::LISTENING}
     {}
 
