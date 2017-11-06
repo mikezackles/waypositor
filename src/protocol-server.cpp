@@ -54,37 +54,38 @@ namespace waypositor {
   };
 
   // This is pretty complex in order to support shutting down the server
-  // cleanly. There might be a simpler way. It's currently thread safe, but I
-  // don't see why we'd ever need more than one thread for this.
+  // cleanly. There might be a simpler way. It's currently intended to be thread
+  // safe, but I don't see why we'd ever need more than one thread for this.
   class Registry final {
   private:
+    class Connection;
+    class Handle {
+    private:
+      std::shared_ptr<Connection> mHandle;
+    public:
+      // These should be deleted, but there was a bug in gcc:
+      // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80654
+      Handle(Handle const &);
+      Handle &operator=(Handle const &);
+      Handle(Handle &&) = default;
+      Handle &operator=(Handle &&) = default;
+      ~Handle() { if (mHandle) mHandle->close(); }
+
+      Handle(std::shared_ptr<Connection> handle)
+        : mHandle{std::move(handle)}
+      {}
+    };
+    using Lookup = std::unordered_map<std::size_t, Handle>;
+
     class Connection final {
     private:
       Logger &mLog;
       asio::io_service &mAsio;
-      Registry &mOwner;
+      std::weak_ptr<Lookup> mOwner;
       std::size_t mId;
       std::mutex mMutex;
       std::optional<Domain::socket> mSocket;
       Parser mParser;
-
-      class Continuer final {
-      private:
-        std::shared_ptr<Connection> self;
-      public:
-        template <typename Buffers>
-        void async_read(Buffers &&buffers) {
-          asio::async_read(*self->mSocket, buffers, Worker{std::move(self)});
-        }
-
-        void suspend() {
-          self->mAsio.post(Worker{std::move(self)});
-        }
-
-        Continuer(std::shared_ptr<Connection> &&self_)
-          : self{std::move(self_)}
-        {}
-      };
 
       class Worker final {
       private:
@@ -95,10 +96,31 @@ namespace waypositor {
         Worker(Worker &&other) = default;
         Worker &operator=(Worker &&other) = default;
         ~Worker() {
-          if (self) self->mOwner.mLookup.erase(self->mId);
+          if (!self) return;
+          auto owner = self->mOwner.lock();
+          if (!owner) return;
+          owner->erase(self->mId);
         }
 
         Worker(std::shared_ptr<Connection> self_) : self{std::move(self_)} {}
+
+        class Continuer {
+        private:
+          Worker &mWorker;
+        public:
+          Continuer(Worker &worker) : mWorker{worker} {}
+
+          template <typename Buffers>
+          void async_read(Buffers &&buffers) {
+            asio::async_read(
+              *mWorker.self->mSocket, buffers, std::move(mWorker)
+            );
+          }
+
+          void suspend() {
+            mWorker.self->mAsio.post(std::move(mWorker));
+          }
+        };
 
         void operator()(
           boost::system::error_code const &error = {}, std::size_t = 0
@@ -115,7 +137,7 @@ namespace waypositor {
             return;
           }
 
-          self->mParser.resume(self->mLog, Continuer{std::move(self)});
+          self->mParser.resume(self->mLog, Continuer{*this});
         }
 
         explicit operator bool() const { return self != nullptr; }
@@ -126,7 +148,8 @@ namespace waypositor {
       Connection(
         Private // make it effectively private
       , Logger &log, asio::io_service &asio
-      , Registry &owner, std::size_t id, Domain::socket socket
+      , std::shared_ptr<Lookup> const &owner
+      , std::size_t id, Domain::socket socket
       ) : mLog{log}, mAsio{asio}, mOwner{owner}, mId{id}
         , mMutex{}, mSocket{std::move(socket)}
         , mParser{}
@@ -138,26 +161,10 @@ namespace waypositor {
         mSocket = std::nullopt;
       }
 
-      class Handle {
-      private:
-        std::shared_ptr<Connection> mHandle;
-      public:
-        // These should be deleted, but there was a bug in gcc:
-        // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80654
-        Handle(Handle const &);
-        Handle &operator=(Handle const &);
-        Handle(Handle &&) = default;
-        Handle &operator=(Handle &&) = default;
-        ~Handle() { if (mHandle) mHandle->close(); }
-
-        Handle(std::shared_ptr<Connection> handle)
-          : mHandle{std::move(handle)}
-        {}
-      };
-
       static Handle create(
         Logger &log, asio::io_service &asio
-      , Registry &owner, std::size_t id, Domain::socket socket
+      , std::shared_ptr<Lookup> const &owner
+      , std::size_t id, Domain::socket socket
       ) {
         auto pointer = std::make_shared<Connection>(
           Private{}, log, asio, owner, id, std::move(socket)
@@ -167,16 +174,16 @@ namespace waypositor {
       }
     };
 
-    std::unordered_map<std::size_t, Connection::Handle> mLookup{};
+    std::shared_ptr<Lookup> mLookup{std::make_shared<Lookup>()};
     std::size_t mCurrentId{0};
   public:
     void connect(
       Logger &log, asio::io_service &asio, Domain::socket socket
     ) {
       auto handle = Connection::create(
-        log, asio, *this, mCurrentId, std::move(socket)
+        log, asio, mLookup, mCurrentId, std::move(socket)
       );
-      mLookup.emplace(mCurrentId, std::move(handle));
+      mLookup->emplace(mCurrentId, std::move(handle));
       log.info("Connection ", mCurrentId, " accepted");
       mCurrentId++;
     }
