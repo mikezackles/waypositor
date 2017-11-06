@@ -42,12 +42,10 @@ namespace waypositor {
         async_read(asio::buffer(&mMessageSize, sizeof(uint16_t)));
         return;
       case State::FINISHED:
-        log.info(
-          "Finished parsing header\n"
-        , "Object ID: ", mObjectId, "\n"
-        , "Message Size: ", mMessageSize, "\n"
-        , "Opcode: ", mOpcode
-        );
+        log.info("Finished parsing header");
+        log.info("Object ID: ", mObjectId);
+        log.info("Message Size: ", mMessageSize);
+        log.info("Opcode: ", mOpcode);
         return;
       }
     }
@@ -62,6 +60,7 @@ namespace waypositor {
     private:
       Logger &mLog;
       Registry &mOwner;
+      std::size_t mId;
       std::mutex mMutex;
       std::optional<Domain::socket> mSocket;
       Parser mParser;
@@ -75,7 +74,7 @@ namespace waypositor {
         Worker(Worker &&other) = default;
         Worker &operator=(Worker &&other) = default;
         ~Worker() {
-          if (self) self->mOwner.mLookup.erase(self.get());
+          if (self) self->mOwner.mLookup.erase(self->mId);
         }
 
         Worker(std::shared_ptr<Connection> self_) : self{std::move(self_)} {}
@@ -110,11 +109,12 @@ namespace waypositor {
     public:
       Connection(
         Private // make it effectively private
-      , Logger &log, Registry &owner, Domain::socket socket
-      ) : mLog{log}, mOwner{owner}
+      , Logger &log, Registry &owner, std::size_t id, Domain::socket socket
+      ) : mLog{log}, mOwner{owner}, mId{id}
         , mMutex{}, mSocket{std::move(socket)}
         , mParser{}
       {}
+      ~Connection() { mLog.info("Connection ", mId, " destroyed"); }
 
       void close() {
         auto lock = std::lock_guard(mMutex);
@@ -133,36 +133,35 @@ namespace waypositor {
         Handle &operator=(Handle &&) = default;
         ~Handle() { if (mHandle) mHandle->close(); }
 
-        Connection *get() { return mHandle.get(); }
-
         Handle(std::shared_ptr<Connection> handle)
           : mHandle{std::move(handle)}
         {}
       };
 
       static Handle create(
-        Logger &log, Registry &owner, Domain::socket socket
+        Logger &log, Registry &owner, std::size_t id, Domain::socket socket
       ) {
         auto pointer = std::make_shared<Connection>(
-          Private{}, log, owner, std::move(socket)
+          Private{}, log, owner, id, std::move(socket)
         );
         Worker{pointer}();
         return {std::move(pointer)};
       }
     };
 
-    std::unordered_map<Connection *, Connection::Handle> mLookup;
+    std::unordered_map<std::size_t, Connection::Handle> mLookup{};
+    std::size_t mCurrentId{0};
   public:
     void connect(
       Logger &log, Domain::socket socket
     ) {
       auto handle = Connection::create(
-        log, *this, std::move(socket)
+        log, *this, mCurrentId, std::move(socket)
       );
-      mLookup.emplace(handle.get(), std::move(handle));
+      mLookup.emplace(mCurrentId, std::move(handle));
+      log.info("Connection ", mCurrentId, " accepted");
+      mCurrentId++;
     }
-
-    Registry() = default;
   };
 
   class Listener final {
@@ -209,7 +208,6 @@ namespace waypositor {
           self->mAcceptor.async_accept(self->mSocket, std::move(*this));
           return;
         case State::ACCEPTED:
-          self->mLog.info("Connection accepted");
           self->mConnections->connect(self->mLog, std::move(self->mSocket));
           self->mState = State::LISTENING;
           self->mAsio.post(std::move(*this));
