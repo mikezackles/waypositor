@@ -18,6 +18,41 @@ namespace waypositor {
   namespace asio = boost::asio;
   using Domain = asio::local::stream_protocol;
 
+  class Parser {
+  private:
+    enum class State { OBJECT_ID, MESSAGE_SIZE, OPCODE, FINISHED };
+    uint32_t mObjectId;
+    uint16_t mMessageSize;
+    uint16_t mOpcode;
+    State mState{State::OBJECT_ID};
+  public:
+    template <typename AsyncRead>
+    void resume(Logger &log, AsyncRead async_read) {
+      switch (mState) {
+      case State::OBJECT_ID:
+        mState = State::MESSAGE_SIZE;
+        async_read(asio::buffer(&mObjectId, sizeof(uint32_t)));
+        return;
+      case State::MESSAGE_SIZE:
+        mState = State::OPCODE;
+        async_read(asio::buffer(&mMessageSize, sizeof(uint16_t)));
+        return;
+      case State::OPCODE:
+        mState = State::FINISHED;
+        async_read(asio::buffer(&mOpcode, sizeof(uint16_t)));
+        return;
+      case State::FINISHED:
+        log.info(
+          "Finished parsing header\n"
+        , "Object ID: ", mObjectId, "\n"
+        , "Message Size: ", mMessageSize, "\n"
+        , "Opcode: ", mOpcode
+        );
+        return;
+      }
+    }
+  };
+
   // This is pretty complex in order to support shutting down the server
   // cleanly. There might be a simpler way. It's currently thread safe, but I
   // don't see why we'd ever need more than one thread for this.
@@ -29,6 +64,7 @@ namespace waypositor {
       Registry &mOwner;
       std::mutex mMutex;
       std::optional<Domain::socket> mSocket;
+      Parser mParser;
 
       class Worker final {
       private:
@@ -59,8 +95,11 @@ namespace waypositor {
             return;
           }
 
-          asio::async_read(
-            *self->mSocket, asio::null_buffers(), std::move(*this)
+          self->mParser.resume(
+            self->mLog
+          , [this](auto &&buffers) {
+              asio::async_read(*self->mSocket, buffers, std::move(*this));
+            }
           );
         }
 
@@ -74,6 +113,7 @@ namespace waypositor {
       , Logger &log, Registry &owner, Domain::socket socket
       ) : mLog{log}, mOwner{owner}
         , mMutex{}, mSocket{std::move(socket)}
+        , mParser{}
       {}
 
       void close() {
