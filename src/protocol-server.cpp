@@ -26,8 +26,8 @@ namespace waypositor {
     uint16_t mMessageSize;
     State mState{State::OBJECT_ID};
   public:
-    template <typename AsyncRead>
-    void resume(Logger &log, AsyncRead async_read) {
+    template <typename AsyncRead, typename Suspend>
+    void resume(Logger &log, AsyncRead async_read, Suspend suspend) {
       switch (mState) {
       case State::OBJECT_ID:
         mState = State::OPCODE;
@@ -46,6 +46,8 @@ namespace waypositor {
         log.info("Object ID: ", mObjectId);
         log.info("Message Size: ", mMessageSize);
         log.info("Opcode: ", mOpcode);
+        mState = State::OBJECT_ID;
+        suspend();
         return;
       }
     }
@@ -59,6 +61,7 @@ namespace waypositor {
     class Connection final {
     private:
       Logger &mLog;
+      asio::io_service &mAsio;
       Registry &mOwner;
       std::size_t mId;
       std::mutex mMutex;
@@ -99,6 +102,7 @@ namespace waypositor {
           , [this](auto &&buffers) {
               asio::async_read(*self->mSocket, buffers, std::move(*this));
             }
+          , [this] { self->mAsio.post(std::move(*this)); }
           );
         }
 
@@ -109,8 +113,9 @@ namespace waypositor {
     public:
       Connection(
         Private // make it effectively private
-      , Logger &log, Registry &owner, std::size_t id, Domain::socket socket
-      ) : mLog{log}, mOwner{owner}, mId{id}
+      , Logger &log, asio::io_service &asio
+      , Registry &owner, std::size_t id, Domain::socket socket
+      ) : mLog{log}, mAsio{asio}, mOwner{owner}, mId{id}
         , mMutex{}, mSocket{std::move(socket)}
         , mParser{}
       {}
@@ -139,10 +144,11 @@ namespace waypositor {
       };
 
       static Handle create(
-        Logger &log, Registry &owner, std::size_t id, Domain::socket socket
+        Logger &log, asio::io_service &asio
+      , Registry &owner, std::size_t id, Domain::socket socket
       ) {
         auto pointer = std::make_shared<Connection>(
-          Private{}, log, owner, id, std::move(socket)
+          Private{}, log, asio, owner, id, std::move(socket)
         );
         Worker{pointer}();
         return {std::move(pointer)};
@@ -153,10 +159,10 @@ namespace waypositor {
     std::size_t mCurrentId{0};
   public:
     void connect(
-      Logger &log, Domain::socket socket
+      Logger &log, asio::io_service &asio, Domain::socket socket
     ) {
       auto handle = Connection::create(
-        log, *this, mCurrentId, std::move(socket)
+        log, asio, *this, mCurrentId, std::move(socket)
       );
       mLookup.emplace(mCurrentId, std::move(handle));
       log.info("Connection ", mCurrentId, " accepted");
@@ -208,7 +214,9 @@ namespace waypositor {
           self->mAcceptor.async_accept(self->mSocket, std::move(*this));
           return;
         case State::ACCEPTED:
-          self->mConnections->connect(self->mLog, std::move(self->mSocket));
+          self->mConnections->connect(
+            self->mLog, self->mAsio, std::move(self->mSocket)
+          );
           self->mState = State::LISTENING;
           self->mAsio.post(std::move(*this));
           return;
