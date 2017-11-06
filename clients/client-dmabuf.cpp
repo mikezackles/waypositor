@@ -47,6 +47,14 @@ struct window {
     struct wl_callback *callback;
 };
 
+enum {
+  MAP_MODE_GBM = 0, // gbm_bo_map
+  MAP_MODE_MMAP, // system mmap
+  MAP_MODE_MAX
+};
+
+static int current_map_mode = MAP_MODE_GBM;
+
 static int running = 1;
 
 static void
@@ -115,7 +123,7 @@ static const struct zwp_linux_buffer_params_v1_listener params_listener = {
 bool draw_content(struct buffer *buffer)
 {
   // Solution1: using gbm_bo_map. But currently not implement in mesa for intel driver. Only for gallium drivers.
-  if (0) {
+  if (current_map_mode == MAP_MODE_GBM) {
     uint32_t stride = 0;
     void* map_info = nullptr;
     uint8_t *raw_data = static_cast<uint8_t *>(gbm_bo_map(buffer->bo, 0, 0, gbm_bo_get_width(buffer->bo),
@@ -137,9 +145,9 @@ bool draw_content(struct buffer *buffer)
   }
 
   // Solution2: generic system call 'mmap'. But bm_bo_get_fd always returns a read-only fd. So we can mmap for RO access but not for RW access.
-  if (0) {
-    size_t length = gbm_bo_get_width (buffer->bo) * gbm_bo_get_height(buffer->bo) ;
-    void* map_data = mmap (0 /* addr */, length, PROT_WRITE, MAP_SHARED, buffer->dmabuf_fd, 0 /* offset */);
+  if (current_map_mode == MAP_MODE_MMAP) {
+    size_t length = gbm_bo_get_width (buffer->bo) * gbm_bo_get_height(buffer->bo) * 4;
+    void* map_data = mmap(0 /* addr */, length, PROT_WRITE, MAP_SHARED, buffer->dmabuf_fd, 0 /* offset */);
 
     if (map_data == MAP_FAILED) {
       fprintf(stderr, "map_bo failed\n");
@@ -150,8 +158,6 @@ bool draw_content(struct buffer *buffer)
     munmap(map_data, length);
   }
 
-  // Solution3: Import the above dmabuf into an EGLImage. Then bind it to a
-  // gl texture attached to a gl FBO. Then draw into it using gl.
   return true;
 }
 
@@ -162,10 +168,15 @@ create_dmabuf_buffer(struct display *display, struct buffer *buffer,
   struct zwp_linux_buffer_params_v1 *params;
   uint64_t modifier = 0;
   uint32_t format = GBM_FORMAT_ARGB8888;
+  uint32_t flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
+  /* gbm_bo_map works with tiled layout, sounds like it makes it virtually
+   * linear for the user. It is not the case for mmap so ensure it. */
+  if (current_map_mode == MAP_MODE_MMAP)
+    flags |= GBM_BO_USE_LINEAR;
 
   buffer->bo = gbm_bo_create(
       display->dev, width, height,
-      format, /*GBM_BO_USE_LINEAR |*/ GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+      format, flags);
   if (!buffer->bo) {
       fprintf(stderr, "gbm_bo_create failed\n");
       return -1;
@@ -424,6 +435,19 @@ is_import_mode_immediate(const char* c)
   return 0;
 }
 
+static int
+check_map_mode(const char* c)
+{
+  if (!strncmp(c, "gbm", 3))
+      return MAP_MODE_GBM;
+  else if (!strncmp(c, "mmap", 4))
+      return MAP_MODE_MMAP;
+  else
+      exit(0);
+
+  return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -432,14 +456,20 @@ main(int argc, char **argv)
   struct window *window;
   int is_immediate = 0;
   int ret = 0, i = 0;
+  current_map_mode = MAP_MODE_GBM;
 
   if (argc > 1) {
     static const char import_mode[] = "--import-immediate=";
+    static const char map_mode[] = "--map-mode=";
     for (i = 1; i < argc; i++) {
       if (!strncmp(argv[i], import_mode,
              sizeof(import_mode) - 1)) {
         is_immediate = is_import_mode_immediate(argv[i]
                     + sizeof(import_mode) - 1);
+      } else if (!strncmp(argv[i], map_mode,
+             sizeof(map_mode) - 1)) {
+        current_map_mode = check_map_mode(argv[i]
+                    + sizeof(map_mode) - 1);
       }
     }
   }
