@@ -1451,7 +1451,7 @@ namespace waypositor {
 
   class EventDispatcher final {
   private:
-    enum class State { WAITING, GOT_EVENT };
+    enum class State { WAITING, GOT_EVENT, STOPPED };
     Logger &mLog;
     drm::Descriptor const &mDrm;
     std::optional<asio::posix::stream_descriptor> mDescriptor;
@@ -1484,10 +1484,9 @@ namespace waypositor {
           return;
         }
 
-        if (!self->mDescriptor)
-          return;
-
         switch (self->mState) {
+        case State::STOPPED:
+          return;
         case State::GOT_EVENT:
           DrawRoutine::handle_event(self->mDrm);
           // Fall through
@@ -1503,7 +1502,10 @@ namespace waypositor {
       explicit operator bool() const { return self != nullptr; }
     };
   public:
-    void stop() { mDescriptor = std::nullopt; }
+    void stop() {
+      mState = State::STOPPED;
+      mDescriptor = std::nullopt;
+    }
 
     EventDispatcher(
       Logger &log, asio::io_service &asio, drm::Descriptor const &drm
@@ -1520,7 +1522,7 @@ int main() {
   using namespace waypositor;
   using namespace std::chrono_literals;
   asio::io_service asio{};
-  asio::steady_timer timer{asio, 15s};
+  asio::steady_timer timer{asio, 5s};
   //asio::signal_set signals{asio, SIGINT, SIGTERM};
   Logger logger{"Main"};
   auto gpu = GPU::create(logger, "/dev/dri/card0");
