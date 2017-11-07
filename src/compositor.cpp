@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
+#include <linux/vt.h>
 
 #include <gbm.h>
 #include <xf86drm.h>
@@ -36,45 +37,6 @@
 
 namespace waypositor {
   namespace asio = boost::asio;
-
-  class FileDescriptor final {
-  private:
-    int mHandle;
-  public:
-    FileDescriptor() : mHandle{-1} {}
-    FileDescriptor(Logger &log, char const *path)
-      : mHandle{open(path, O_RDWR)}
-    {
-      if (!mHandle) log.perror("Couldn't open file");
-    }
-
-    FileDescriptor(FileDescriptor const &) = delete;
-    FileDescriptor(FileDescriptor &&other) noexcept
-      : mHandle{other.mHandle}
-    {
-      other.mHandle = -1;
-    }
-    FileDescriptor &operator=(FileDescriptor const &) = delete;
-    FileDescriptor &operator=(FileDescriptor &&other) noexcept {
-      // This class is final, and nothing here can throw exceptions.
-      if (&other == this) return *this;
-      this->~FileDescriptor();
-      new (this) FileDescriptor{std::move(other)};
-      return *this;
-    }
-    ~FileDescriptor() {
-      if (*this) close(mHandle);
-    }
-
-    explicit operator bool() const {
-      return mHandle >= 0;
-    }
-
-    int get() const {
-      assert(*this);
-      return mHandle;
-    }
-  };
 
   template <typename T>
   class Span final {
@@ -96,38 +58,82 @@ namespace waypositor {
   namespace drm {
     class Descriptor final {
     private:
-      Logger *mLog;
-      FileDescriptor mFile;
-      Descriptor(Logger &log, FileDescriptor file)
-        : mLog{&log}, mFile{std::move(file)}
-      { assert(*this); }
+      int mHandle;
     public:
-      Descriptor() = default;
-      static Descriptor create(Logger &log, char const *path) {
-        FileDescriptor file{log, path};
-        if (!file) return {};
+      Descriptor() : mHandle{-1} {}
+      Descriptor(Logger &log, char const *path)
+        : mHandle{open(path, O_RDWR)}
+      {
+        if (!mHandle) log.perror("Couldn't open file");
+      }
 
-        int error = drmSetMaster(file.get());
+      Descriptor(Descriptor const &) = delete;
+      Descriptor(Descriptor &&other) noexcept
+        : mHandle{other.mHandle}
+      {
+        other.mHandle = -1;
+      }
+      Descriptor &operator=(Descriptor const &) = delete;
+      Descriptor &operator=(Descriptor &&other) noexcept {
+        // This class is final, and nothing here can throw exceptions.
+        if (&other == this) return *this;
+        this->~Descriptor();
+        new (this) Descriptor{std::move(other)};
+        return *this;
+      }
+      ~Descriptor() {
+        if (*this) close(mHandle);
+      }
+
+      explicit operator bool() const {
+        return mHandle >= 0;
+      }
+
+      int get() const {
+        assert(*this);
+        return mHandle;
+      }
+    };
+
+    class Master final {
+    private:
+      Logger *mLog;
+      Descriptor const *mDrm;
+      Master(Logger &log, Descriptor const &drm) : mLog{&log}, mDrm{&drm} {}
+    public:
+      static Master create(Logger &log, Descriptor const &drm) {
+        int error = drmSetMaster(drm.get());
         if (error) {
           log.perror("Couldn't become drm master!");
           return {};
         }
 
-        return {log, std::move(file)};
+        return {log, drm};
       }
-      Descriptor(Descriptor const &) = delete;
-      Descriptor &operator=(Descriptor const &) = delete;
-      Descriptor(Descriptor &&) = default;
-      Descriptor &operator=(Descriptor &&) = default;
-      ~Descriptor() {
+      Master() : mLog{nullptr}, mDrm{nullptr} {}
+      Master(Master const &) = delete;
+      Master &operator=(Master const &) = delete;
+      Master(Master &&other) : mLog{other.mLog}, mDrm{other.mDrm} {
+        other.mLog = nullptr;
+        other.mDrm = nullptr;
+      }
+      Master &operator=(Master &&other) {
+        if (this == &other) return *this;
+        mLog = other.mLog;
+        mDrm = other.mDrm;
+        other.mLog = nullptr;
+        other.mDrm = nullptr;
+        return *this;
+      }
+      ~Master() {
         if (!*this) return;
-        int error = drmDropMaster(mFile.get());
+        int error = drmDropMaster(mDrm->get());
         if (error) mLog->error("Error dropping drm master!");
       }
 
-      explicit operator bool() const { return (mLog != nullptr) && mFile; }
-
-      int get() const { assert(*this); return mFile.get(); }
+      explicit operator bool() const {
+        return mLog != nullptr && mDrm != nullptr;
+      }
     };
 
     class Encoder final {
@@ -850,7 +856,7 @@ namespace waypositor {
     egl::Display const &egl() const { return mEGL; }
 
     static GPU create(Logger &log, char const *path) {
-      auto drm = drm::Descriptor::create(log, path);
+      drm::Descriptor drm{log, path};
       if (!drm) return {};
 
       gbm::Device gbm{log, drm};
@@ -1548,6 +1554,9 @@ int main(int, char **argv) {
 
   DispatcherThread dispatcher{logger, gpu.drm()};
 
+  std::optional<drm::Master> master = drm::Master::create(logger, gpu.drm());
+  if (!*master) return EXIT_FAILURE;
+
   std::optional<DeviceManager> device_manager = DeviceManager::create(
     logger, gpu
   );
@@ -1556,19 +1565,41 @@ int main(int, char **argv) {
   device_manager->update_connections();
 
   // Handle signals
-  asio::signal_set signals{asio, SIGINT, SIGTERM};
-  signals.async_wait([&](
+  asio::signal_set tty_signals{asio, SIGUSR1, SIGUSR2};
+  tty_signals.async_wait([&](
+    boost::system::error_code const &error, int signal
+  ) {
+    if (error) {
+      logger.error("Problem with signal handler");
+      return;
+    }
+    switch (signal) {
+    case SIGUSR1:
+      master = std::nullopt;
+      ioctl(STDIN_FILENO, VT_RELDISP, 1);
+      return;
+    case SIGUSR2:
+      ioctl(STDIN_FILENO, VT_RELDISP, VT_ACKACQ);
+      master = drm::Master::create(logger, gpu.drm());
+      return;
+    }
+  });
+
+  asio::signal_set interrupts{asio, SIGINT, SIGTERM};
+  interrupts.async_wait([&](
     boost::system::error_code const &error, int /*signal*/
   ) {
     if (error) {
       logger.error("Problem with signal handler");
       return;
     }
+
     device_manager->stop_threads();
     // Important! Wait for drawing threads to stop before stopping the
     // dispatcher.
     device_manager = std::nullopt;
     dispatcher.stop();
+    logger.info("HERE");
   });
 
   asio.run();
