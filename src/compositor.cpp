@@ -1484,6 +1484,9 @@ namespace waypositor {
           return;
         }
 
+        if (!self->mDescriptor)
+          return;
+
         switch (self->mState) {
         case State::GOT_EVENT:
           DrawRoutine::handle_event(self->mDrm);
