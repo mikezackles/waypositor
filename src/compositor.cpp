@@ -1536,13 +1536,13 @@ namespace waypositor {
   };
 }
 
-int main() {
+int main(int, char **argv) {
   using namespace waypositor;
-  using namespace std::chrono_literals;
+
   asio::io_service asio{};
-  asio::steady_timer timer{asio, 5s};
-  //asio::signal_set signals{asio, SIGINT, SIGTERM};
+
   Logger logger{"Main"};
+
   auto gpu = GPU::create(logger, "/dev/dri/card0");
   if (!gpu) return EXIT_FAILURE;
 
@@ -1554,20 +1554,14 @@ int main() {
   if (!device_manager) return EXIT_FAILURE;
 
   device_manager->update_connections();
-  //signals.async_wait([&](
-  //  boost::system::error_code const &error, int /*signal*/
-  //) {
-  //  if (error) {
-  //    std::cerr << "Problem with signal handler" << std::endl;
-  //    return;
-  //  }
-  //  drm.stop_threads();
-  //});
-  timer.async_wait([&](
-    boost::system::error_code const &error
+
+  // Handle signals
+  asio::signal_set signals{asio, SIGINT, SIGTERM};
+  signals.async_wait([&](
+    boost::system::error_code const &error, int /*signal*/
   ) {
     if (error) {
-      logger.error("Problem with timer");
+      logger.error("Problem with signal handler");
       return;
     }
     device_manager->stop_threads();
@@ -1576,6 +1570,8 @@ int main() {
     device_manager = std::nullopt;
     dispatcher.stop();
   });
+
   asio.run();
+  logger.info(argv[0], " stopped successfully");
   return EXIT_SUCCESS;
 }
