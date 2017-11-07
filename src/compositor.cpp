@@ -1382,10 +1382,6 @@ namespace waypositor {
       return (mLog != nullptr) && mGPU;
     }
 
-    static bool handle_event(drm::Descriptor const &drm) {
-      return DrawRoutine::handle_event(drm);
-    }
-
     void stop_threads() {
       assert(*this);
       for (auto &pair : mDisplayLookup) {
@@ -1507,6 +1503,9 @@ namespace waypositor {
       mDescriptor = std::nullopt;
     }
 
+    // Should only be called once!
+    void launch() { Worker{*this}(); }
+
     EventDispatcher(
       Logger &log, asio::io_service &asio, drm::Descriptor const &drm
     ) : mLog{log}, mDrm{drm}
@@ -1514,7 +1513,26 @@ namespace waypositor {
           asio, ::dup(drm.get())
         )}
       , mState{State::WAITING}
-    { Worker{*this}(); }
+    {}
+  };
+
+  class DispatcherThread {
+  private:
+    asio::io_service mAsio;
+    EventDispatcher mDispatcher;
+    detail::RAIIThread mThread;
+  public:
+    DispatcherThread(
+      Logger &log, drm::Descriptor const &drm
+    ) : mAsio{}
+      , mDispatcher{log, mAsio, drm}
+      , mThread{[this] {
+          mDispatcher.launch();
+          mAsio.run();
+        }}
+    {}
+
+    void stop() { mDispatcher.stop(); }
   };
 }
 
@@ -1528,9 +1546,11 @@ int main() {
   auto gpu = GPU::create(logger, "/dev/dri/card0");
   if (!gpu) return EXIT_FAILURE;
 
-  EventDispatcher dispatcher{logger, asio, gpu.drm()};
+  DispatcherThread dispatcher{logger, gpu.drm()};
 
-  auto device_manager = DeviceManager::create(logger, gpu);
+  std::optional<DeviceManager> device_manager = DeviceManager::create(
+    logger, gpu
+  );
   if (!device_manager) return EXIT_FAILURE;
 
   device_manager->update_connections();
@@ -1551,6 +1571,9 @@ int main() {
       return;
     }
     device_manager->stop_threads();
+    // Important! Wait for drawing threads to stop before stopping the
+    // dispatcher.
+    device_manager = std::nullopt;
     dispatcher.stop();
   });
   asio.run();
