@@ -27,7 +27,7 @@ namespace waypositor {
     State mState{State::OBJECT_ID};
   public:
     template <typename Continuer>
-    void resume(Logger &log, Continuer continuer) {
+    void resume(Continuer continuer) {
       switch (mState) {
       case State::OBJECT_ID:
         mState = State::OPCODE;
@@ -42,10 +42,10 @@ namespace waypositor {
         continuer.async_read(asio::buffer(&mMessageSize, sizeof(uint16_t)));
         return;
       case State::FINISHED:
-        log.info("Finished parsing header");
-        log.info("Object ID: ", mObjectId);
-        log.info("Message Size: ", mMessageSize);
-        log.info("Opcode: ", mOpcode);
+        continuer.log_info("Finished parsing header");
+        continuer.log_info("Object ID: ", mObjectId);
+        continuer.log_info("Message Size: ", mMessageSize);
+        continuer.log_info("Opcode: ", mOpcode);
         mState = State::OBJECT_ID;
         continuer.suspend();
         return;
@@ -87,6 +87,16 @@ namespace waypositor {
       std::optional<Domain::socket> mSocket;
       Parser mParser;
 
+      template <typename ...Args>
+      void log_info(Args&&... args) {
+        mLog.info("(Connection ", mId, ") ", std::forward<Args>(args)...);
+      }
+
+      template <typename ...Args>
+      void log_error(Args&&... args) {
+        mLog.error("(Connection ", mId, ") ", std::forward<Args>(args)...);
+      }
+
       class Worker final {
       private:
         std::shared_ptr<Connection> self;
@@ -120,26 +130,36 @@ namespace waypositor {
           void suspend() {
             mWorker.self->mAsio.post(std::move(mWorker));
           }
+
+          template <typename ...Args>
+          void log_info(Args&&... args) {
+            mWorker.self->log_info(std::forward<Args>(args)...);
+          }
+
+          template <typename ...Args>
+          void log_error(Args&&... args) {
+            mWorker.self->log_error(std::forward<Args>(args)...);
+          }
         };
 
         void operator()(
           boost::system::error_code const &error = {}, std::size_t = 0
         ) {
           if (error) {
-            self->mLog.error(
-              "(Connection ", self->mId, ") ASIO error: ", error.message()
+            self->log_error(
+              "ASIO error: ", error.message()
             );
             return;
           }
           auto lock = std::lock_guard(self->mMutex);
           if (!self->mSocket) {
-            self->mLog.info(
-              "Connection worker exiting due to connection closure"
+            self->log_error(
+              "Exiting due to connection closure"
             );
             return;
           }
 
-          self->mParser.resume(self->mLog, Continuer{*this});
+          self->mParser.resume(Continuer{*this});
         }
 
         explicit operator bool() const { return self != nullptr; }
@@ -228,7 +248,7 @@ namespace waypositor {
 
         switch (self->mState) {
         case State::STOPPED:
-          self->mLog.info("Socket listener stopped by request");
+          self->mLog.info("(Listener) stopped by request");
           return;
         case State::LISTENING:
           self->mState = State::ACCEPTED;
