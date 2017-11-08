@@ -119,6 +119,7 @@ namespace waypositor {
       Master(Logger &log, Descriptor const &drm) : mLog{&log}, mDrm{&drm} {}
     public:
       static Master create(Logger &log, Descriptor const &drm) {
+        log.info("Becoming DRM master");
         int error = drmSetMaster(drm.get());
         if (error) {
           log.perror("Couldn't become drm master!");
@@ -144,6 +145,7 @@ namespace waypositor {
       }
       ~Master() {
         if (!*this) return;
+        mLog->info("Dropping DRM master");
         int error = drmDropMaster(mDrm->get());
         if (error) mLog->error("Error dropping drm master!");
       }
@@ -337,11 +339,6 @@ namespace waypositor {
         return true;
       }
     }
-
-    struct FlipData {
-      std::atomic<uint32_t> crtc_id;
-      bool flip_is_pending;
-    };
   }
 
   namespace gbm {
@@ -1130,8 +1127,6 @@ namespace waypositor {
     // Not thread safe
     void stop() { mState = State::STOPPED; }
 
-    // This is intended to live on a "coroutine stack" that lives for the
-    // duration of io_service::run
     FPSTimer(
       Logger &log, asio::io_service &asio
     , asio::steady_timer::duration delta = std::chrono::seconds{1}
@@ -1326,10 +1321,8 @@ namespace waypositor {
     uint32_t crtc_id() const { return mCrtcID; }
 
     void stop() {
-      mASIO.post([this] {
-        mWork = std::nullopt;
-        mFPS.stop();
-      });
+      mWork = std::nullopt;
+      mASIO.post([this] { mFPS.stop(); });
     }
 
     explicit operator bool() const { return static_cast<bool>(mThread); }
@@ -1550,6 +1543,51 @@ namespace waypositor {
     {}
     ~DispatcherThread() { mAsio.post([this] { mDispatcher.stop(); }); }
   };
+
+  namespace vt {
+    // NOTE! This basically assumes it is launched directly from a virtual
+    // terminal for now. It will need updating.
+    class Mode final {
+    private:
+      Logger &mLog;
+      int mTTY;
+
+      struct Private {};
+    public:
+      Mode(Private, Logger &log, int tty) : mLog{log}, mTTY{tty} {}
+
+      static std::optional<Mode> create(Logger &log, int tty) {
+        log.info("Requesting VT control");
+        struct vt_mode mode{};
+        mode.mode = VT_PROCESS;
+        mode.relsig = SIGUSR1;
+        mode.acqsig = SIGUSR2;
+        if (ioctl(tty, VT_SETMODE, &mode) < 0) {
+          log.perror("Request for control of VT failed");
+          return std::nullopt;
+        }
+        return std::make_optional<Mode>(Private{}, log, tty);
+      }
+      ~Mode() {
+        mLog.info("Releasing VT control");
+        struct vt_mode mode{};
+        mode.mode = VT_AUTO;
+        if (ioctl(mTTY, VT_SETMODE, &mode) < 0) {
+          mLog.error("Couldn't release control of VT");
+        }
+        //mLog.info("Reactivating TTY");
+        //struct vt_stat state{};
+        //if (ioctl(mTTY, VT_GETSTATE, &state) < 0) {
+        //  mLog.error("Couldn't get VT state");
+        //}
+        //if (ioctl(mTTY, VT_ACTIVATE, state.v_active) < 0
+        // || ioctl(mTTY, VT_WAITACTIVE, state.v_active) < 0)
+        //{
+        //  mLog.error("Couldn't reactivate TTY");
+        //}
+      }
+    };
+  }
 }
 
 int main(int, char **argv) {
@@ -1558,6 +1596,9 @@ int main(int, char **argv) {
   asio::io_service asio{};
 
   Logger logger{"Main"};
+
+  auto vt_mode = vt::Mode::create(logger, STDIN_FILENO);
+  if (!vt_mode) return EXIT_FAILURE;
 
   auto gpu = GPU::create(logger, "/dev/dri/card0");
   if (!gpu) return EXIT_FAILURE;
@@ -1594,10 +1635,12 @@ int main(int, char **argv) {
     }
     switch (signal) {
     case SIGUSR1:
+      logger.info("VT release requested");
       master = std::nullopt;
       ioctl(STDIN_FILENO, VT_RELDISP, 1);
       return;
     case SIGUSR2:
+      logger.info("VT acquire requested");
       ioctl(STDIN_FILENO, VT_RELDISP, VT_ACKACQ);
       master = drm::Master::create(logger, gpu.drm());
       return;
@@ -1613,7 +1656,8 @@ int main(int, char **argv) {
       return;
     }
 
-    // Stop the dispatcher because it holds references into the device manager
+    // We stop the dispatcher first because it holds references into the device
+    // manager
     dispatcher = std::nullopt;
     device_manager = std::nullopt;
   });
