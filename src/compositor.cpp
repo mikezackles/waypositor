@@ -1625,12 +1625,14 @@ int main(int, char **argv) {
     return EXIT_FAILURE;
   }
 
-  asio::signal_set tty_signals{asio, SIGUSR1, SIGUSR2};
-  tty_signals.async_wait([&](
+  auto tty_signals = std::make_optional<asio::signal_set>(
+    asio, SIGUSR1, SIGUSR2
+  );
+  tty_signals->async_wait([&](
     boost::system::error_code const &error, int signal
   ) {
     if (error) {
-      logger.error("Problem with signal handler");
+      logger.error("(TTY signal handler) ASIO error: ", error.message());
       return;
     }
     switch (signal) {
@@ -1638,12 +1640,12 @@ int main(int, char **argv) {
       logger.info("VT release requested");
       master = std::nullopt;
       ioctl(STDIN_FILENO, VT_RELDISP, 1);
-      return;
+      break;
     case SIGUSR2:
       logger.info("VT acquire requested");
       ioctl(STDIN_FILENO, VT_RELDISP, VT_ACKACQ);
       master = drm::Master::create(logger, gpu.drm());
-      return;
+      break;
     }
   });
 
@@ -1652,14 +1654,18 @@ int main(int, char **argv) {
     boost::system::error_code const &error, int /*signal*/
   ) {
     if (error) {
-      logger.error("Problem with signal handler");
+      logger.error(
+        "(SIGINT/SIGTERM signal handler) ASIO error: ", error.message()
+      );
       return;
     }
 
+    logger.info("SIGINT/SIGTERM signal handler invoked");
     // We stop the dispatcher first because it holds references into the device
     // manager
     dispatcher = std::nullopt;
     device_manager = std::nullopt;
+    tty_signals = std::nullopt;
   });
 
   asio.run();
