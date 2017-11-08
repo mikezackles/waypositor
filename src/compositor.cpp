@@ -38,6 +38,23 @@
 namespace waypositor {
   namespace asio = boost::asio;
 
+  class LoggedThread {
+  private:
+    Logger &mLog;
+    std::thread mThread;
+  public:
+    template <typename ...Args>
+    LoggedThread(std::string name, Logger &log, Args&&... args)
+      : mLog{log}, mThread{std::forward<Args>(args)...}
+    { mLog.register_thread(mThread.get_id(), std::move(name)); }
+    ~LoggedThread() {
+      // Keep the logger around until the thread is done
+      mThread.join();
+      mLog.unregister_thread(mThread.get_id());
+    }
+    explicit operator bool() const { return mThread.joinable(); }
+  };
+
   template <typename T>
   class Span final {
   private:
@@ -1292,7 +1309,13 @@ namespace waypositor {
     std::optional<asio::io_service::work> mWork;
     FPSTimer mFPS;
     uint32_t mCrtcID;
-    detail::RAIIThread mThread;
+    LoggedThread mThread;
+
+    static std::string thread_name(uint32_t crtc_id) {
+      std::stringstream name{};
+      name << "Draw " << crtc_id;
+      return name.str();
+    }
   public:
     // Run something on the drawing thread
     template <typename Callback>
@@ -1321,26 +1344,24 @@ namespace waypositor {
       , mWork{std::make_optional<asio::io_service::work>(mASIO)}
       , mFPS{log, mASIO}
       , mCrtcID{mode.crtc_id()}
-      , mThread{[
-          this, &log, &gpu, &master_context
-        , mode = std::move(mode)
-        , draw_callback = std::move(draw_callback)
-        ]() mutable {
-          DrawRoutine::begin(
-            log
-          , mASIO
-          , gpu
-          , mFPS
-          , master_context
-          , std::move(mode)
-          , std::move(draw_callback)
-          );
-        }}
-    {
-      std::stringstream name{};
-      name << "Draw " << mCrtcID;
-      log.register_thread(mThread.get_id(), name.str());
-    }
+      , mThread{
+          thread_name(mCrtcID), log
+        , [ this, &log, &gpu, &master_context
+          , mode = std::move(mode)
+          , draw_callback = std::move(draw_callback)
+          ]() mutable {
+            DrawRoutine::begin(
+              log
+            , mASIO
+            , gpu
+            , mFPS
+            , master_context
+            , std::move(mode)
+            , std::move(draw_callback)
+            );
+          }
+        }
+    {}
   };
 
   class DeviceManager final {
