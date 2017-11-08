@@ -1120,7 +1120,7 @@ namespace waypositor {
     , asio::steady_timer::duration delta = std::chrono::seconds{1}
     ) : mLog{log}, mTimer{asio, delta}, mFrameCount{0}, mDelta{delta}
       , mThen{Clock::now()}, mState{State::STARTING}
-    { Worker{*this}(); }
+    { asio.post([this] { Worker{*this}(); }); }
   };
 
   class DrawRoutine final {
@@ -1180,17 +1180,6 @@ namespace waypositor {
           self->mDisplay->finish_swap_buffers();
           self->mFPS.tick();
 
-          // It's important that we do this when no page flip is pending. Due to
-          // the nature of the drm API, references to this DrawRoutine are
-          // loaned to the event dispatch thread during page flip. See
-          // DrawRoutine::handle_event
-          if (!self->mKeepRunning) {
-            self->mLog.info("Thread exiting due to request");
-            self->mFPS.stop();
-            self->mWork = std::nullopt;
-            return;
-          }
-
           // Fall through
         case State::DRAWING:
           // Do the drawing
@@ -1216,36 +1205,32 @@ namespace waypositor {
     enum class State { MODE_SET, DRAWING, PAGE_FLIP };
     Logger &mLog;
     asio::io_service &mASIO;
-    std::atomic<bool> const &mKeepRunning;
-    std::optional<asio::io_service::work> mWork;
     GPU const &mGPU;
+    FPSTimer &mFPS;
     DisplayMode mMode;
     std::optional<ActiveDisplay> mDisplay;
     std::function<void()> mDrawCallback;
-    FPSTimer mFPS;
     State mState;
     std::optional<Worker> mDormantWorker;
 
     DrawRoutine(
       Logger &log
     , asio::io_service &asio
-    , std::atomic<bool> const &keep_running
     , GPU const &gpu
+    , FPSTimer &fps
     , egl::SurfacelessContext const &master_context
     , DisplayMode mode
     , std::function<void()> draw_callback
     ) : mLog{log}
       , mASIO{asio}
-      , mKeepRunning{keep_running}
-      , mWork{std::make_optional<asio::io_service::work>(asio)}
       , mGPU{gpu}
+      , mFPS{fps}
       , mMode{std::move(mode)}
       , mDisplay{ActiveDisplay::create(
           log, mGPU.gbm(), mGPU.egl(), master_context
         , mMode.width(), mMode.height(), mMode.crtc_id()
         )}
       , mDrawCallback{std::move(draw_callback)}
-      , mFPS{mLog, mASIO}
       , mState{State::MODE_SET}
       , mDormantWorker{std::nullopt}
     { /* No assertion, could be invalid */ }
@@ -1285,14 +1270,14 @@ namespace waypositor {
     static void begin(
       Logger &log
     , asio::io_service &asio
-    , std::atomic<bool> const &keep_running
     , GPU const &gpu
+    , FPSTimer &fps
     , egl::SurfacelessContext const &master_context
     , DisplayMode mode
     , std::function<void()> draw_callback
     ) {
       DrawRoutine state{
-        log, asio, keep_running, gpu, master_context
+        log, asio, gpu, fps, master_context
       , std::move(mode), std::move(draw_callback)
       };
       if (!state) return;
@@ -1304,7 +1289,8 @@ namespace waypositor {
   class DrawThread final {
   private:
     asio::io_service mASIO;
-    std::atomic<bool> mKeepRunning;
+    std::optional<asio::io_service::work> mWork;
+    FPSTimer mFPS;
     uint32_t mCrtcID;
     detail::RAIIThread mThread;
   public:
@@ -1316,7 +1302,12 @@ namespace waypositor {
 
     uint32_t crtc_id() const { return mCrtcID; }
 
-    void stop() { mKeepRunning = false; }
+    void stop() {
+      mASIO.post([this] {
+        mWork = std::nullopt;
+        mFPS.stop();
+      });
+    }
 
     explicit operator bool() const { return static_cast<bool>(mThread); }
 
@@ -1327,7 +1318,8 @@ namespace waypositor {
     , DisplayMode mode
     , std::function<void()> draw_callback
     ) : mASIO{}
-      , mKeepRunning{true}
+      , mWork{std::make_optional<asio::io_service::work>(mASIO)}
+      , mFPS{log, mASIO}
       , mCrtcID{mode.crtc_id()}
       , mThread{[
           this, &log, &gpu, &master_context
@@ -1337,8 +1329,8 @@ namespace waypositor {
           DrawRoutine::begin(
             log
           , mASIO
-          , mKeepRunning
           , gpu
+          , mFPS
           , master_context
           , std::move(mode)
           , std::move(draw_callback)
@@ -1361,6 +1353,14 @@ namespace waypositor {
     std::map<uint32_t, DrawThread> mDisplayLookup;
     std::set<uint32_t> mUnusedCrtcs;
 
+    void stop_threads() {
+      assert(*this);
+      for (auto &pair : mDisplayLookup) {
+        DrawThread &thread = pair.second;
+        thread.stop();
+      }
+    }
+
     struct Private {};
   public:
     DeviceManager(
@@ -1371,6 +1371,7 @@ namespace waypositor {
       , mDisplayLookup{}
       , mUnusedCrtcs{std::move(unused_crtcs)}
     { assert(*this); }
+    ~DeviceManager() { this->stop_threads(); }
 
     static std::optional<DeviceManager> create(Logger &log, GPU const &gpu) {
       drm::Resources resources{log, gpu.drm()};
@@ -1386,14 +1387,6 @@ namespace waypositor {
 
     explicit operator bool() const {
       return (mLog != nullptr) && mGPU;
-    }
-
-    void stop_threads() {
-      assert(*this);
-      for (auto &pair : mDisplayLookup) {
-        DrawThread &thread = pair.second;
-        thread.stop();
-      }
     }
 
     void update_connections() {
@@ -1456,7 +1449,7 @@ namespace waypositor {
     enum class State { WAITING, GOT_EVENT, STOPPED };
     Logger &mLog;
     drm::Descriptor const &mDrm;
-    std::optional<asio::posix::stream_descriptor> mDescriptor;
+    asio::posix::stream_descriptor mDescriptor;
     State mState;
 
     class Worker {
@@ -1495,7 +1488,7 @@ namespace waypositor {
         case State::WAITING:
           self->mState = State::GOT_EVENT;
           asio::async_read(
-            *self->mDescriptor, asio::null_buffers(), std::move(*this)
+            self->mDescriptor, asio::null_buffers(), std::move(*this)
           );
           return;
         }
@@ -1506,7 +1499,6 @@ namespace waypositor {
   public:
     void stop() {
       mState = State::STOPPED;
-      mDescriptor = std::nullopt;
     }
 
     // Should only be called once!
@@ -1515,9 +1507,7 @@ namespace waypositor {
     EventDispatcher(
       Logger &log, asio::io_service &asio, drm::Descriptor const &drm
     ) : mLog{log}, mDrm{drm}
-      , mDescriptor{std::make_optional<asio::posix::stream_descriptor>(
-          asio, ::dup(drm.get())
-        )}
+      , mDescriptor{asio, ::dup(drm.get())}
       , mState{State::WAITING}
     {}
   };
@@ -1537,8 +1527,7 @@ namespace waypositor {
           mAsio.run();
         }}
     {}
-
-    void stop() { mDispatcher.stop(); }
+    ~DispatcherThread() { mAsio.post([this] { mDispatcher.stop(); }); }
   };
 }
 
@@ -1552,7 +1541,7 @@ int main(int, char **argv) {
   auto gpu = GPU::create(logger, "/dev/dri/card0");
   if (!gpu) return EXIT_FAILURE;
 
-  DispatcherThread dispatcher{logger, gpu.drm()};
+  auto dispatcher = std::make_optional<DispatcherThread>(logger, gpu.drm());
 
   std::optional<drm::Master> master = drm::Master::create(logger, gpu.drm());
   if (!*master) return EXIT_FAILURE;
@@ -1564,7 +1553,16 @@ int main(int, char **argv) {
 
   device_manager->update_connections();
 
-  // Handle signals
+  // TTY stuff (This doesn't work yet.)
+  struct vt_mode mode{};
+  mode.mode = VT_PROCESS;
+  mode.relsig = SIGUSR1;
+  mode.acqsig = SIGUSR2;
+  if (ioctl(STDIN_FILENO, VT_SETMODE, &mode) < 0) {
+    logger.perror("Request for VT signals failed");
+    return EXIT_FAILURE;
+  }
+
   asio::signal_set tty_signals{asio, SIGUSR1, SIGUSR2};
   tty_signals.async_wait([&](
     boost::system::error_code const &error, int signal
@@ -1594,12 +1592,9 @@ int main(int, char **argv) {
       return;
     }
 
-    device_manager->stop_threads();
-    // Important! Wait for drawing threads to stop before stopping the
-    // dispatcher.
+    // Stop the dispatcher because it holds references into the device manager
+    dispatcher = std::nullopt;
     device_manager = std::nullopt;
-    dispatcher.stop();
-    logger.info("HERE");
   });
 
   asio.run();
