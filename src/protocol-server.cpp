@@ -793,6 +793,8 @@ namespace waypositor {
   //  }
   //};
 
+  // It might be more efficient to read this in one fell swoop instead of one
+  // field at a time, but for now this is easier.
   class HeaderParser final {
   private:
     enum class State { OBJECT_ID, OPCODE, MESSAGE_SIZE, FINISHED };
@@ -854,20 +856,19 @@ namespace waypositor {
 
       void resume() {
         switch (this->frame().mState) {
-        case State::WORKING:
-          this->frame().mState = State::ERROR;
-          this->template coinvoke<HeaderParser, ParseResult>();
-          return;
-        case State::ERROR:
-          // Do nothing;
-          return;
         case State::GOT_DATA:
           this->log_info("Finished parsing header");
           //this->log_info("Message Size: ", this->frame().mMessageSize);
           this->log_info("Object ID: ", this->frame().mObjectId);
           this->log_info("Opcode: ", this->frame().mOpcode);
-          this->frame().mState = State::WORKING;
-          this->suspend();
+          // Fall through
+        case State::WORKING:
+          // It's an error if we resume without getting a return value
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<HeaderParser, ParseResult>();
+          return;
+        case State::ERROR:
+          // Do nothing;
           return;
         }
       }
