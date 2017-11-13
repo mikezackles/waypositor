@@ -118,8 +118,11 @@ namespace waypositor {
           , mParentPointer{std::move(parent_pointer)}
           , mData{std::forward<Args>(args)...}
         {}
-        ParentPointer &parent() { return mParentPointer; }
-        ParentPointer const &parent() const { return mParentPointer; }
+
+        // Dereferencing these on anything but the active frame is bad news!
+        ParentPointer &parent_pointer() { return mParentPointer; }
+        ParentPointer const &parent_pointer() const { return mParentPointer; }
+
         std::size_t parent_offset() const { return mParentOffset; }
         T &data() { return mData; }
         T const &data() const { return mData; }
@@ -135,6 +138,18 @@ namespace waypositor {
       template <typename T, typename ParentPointer>
       auto const &frame() const {
         return reinterpret_cast<Frame<T, ParentPointer> &>(mStore[mOffset]);
+      }
+
+      // Get a reference to a specific frame
+      template <typename T, typename ParentPointer>
+      auto &frame(std::size_t offset) {
+        return reinterpret_cast<Frame<T, ParentPointer> &>(mStore[offset]);
+      }
+
+      // Get a const reference to a specific current frame
+      template <typename T, typename ParentPointer>
+      auto const &frame(std::size_t offset) const {
+        return reinterpret_cast<Frame<T, ParentPointer> &>(mStore[offset]);
       }
 
       // Cast the context pointer to the correct type
@@ -168,16 +183,30 @@ namespace waypositor {
       class Pointer final {
       private:
         Stack *mStack;
-        using FrameT = Frame<T, ParentPointer>;
 
-        FrameT &frame() {
+        auto &frame() {
           return mStack->frame<T, ParentPointer>();
         }
 
-        FrameT const &frame() const {
+        auto const &frame() const {
           return mStack->frame<T, ParentPointer>();
+        }
+
+        auto &parent_frame(std::size_t offset) {
+          return mStack->frame<
+            typename ParentPointer::Type, typename ParentPointer::Parent
+          >(offset);
+        }
+
+        auto const &parent_frame(std::size_t offset) const {
+          return mStack->frame<
+            typename ParentPointer::Type, typename ParentPointer::Parent
+          >(offset);
         }
       public:
+        using Type = T;
+        using Parent = ParentPointer;
+
         Pointer(Pointer const &);
         Pointer &operator=(Pointer const &);
         Pointer(Pointer &&other)
@@ -211,12 +240,11 @@ namespace waypositor {
         template <typename ...Args>
         void coreturn(Args&&... args) {
           assert(*this);
-          // We're not calling coreturn *on* the parent pointer -- we're calling
-          // it on the frame data to which that pointer points. This (the frame
-          // data) is where coroutines should define their coreturn callbacks.
-          // The ReturnTag allows the parent frame to invoke multiple coroutines
+          // Reach into the parent frame to call coreturn. This (the frame data)
+          // is where coroutines should define their coreturn callbacks. The
+          // ReturnTag allows the parent frame to invoke multiple coroutines
           // with different coreturn callbacks.
-          this->frame().parent()->coreturn(
+          this->parent_frame(this->frame().parent_offset()).data().coreturn(
             ReturnTag{}, std::forward<Args>(args)...
           );
         }
@@ -268,7 +296,7 @@ namespace waypositor {
         mOffset = doomed.parent_offset();
         // Reactivate the parent frame's logic, and pass it ownership of the
         // parent's frame pointer
-        ParentLogic logic{std::move(doomed.parent())};
+        ParentLogic logic{std::move(doomed.parent_pointer())};
         // Destroy the current frame
         doomed.~FrameT();
         // Resize the stack. Shrinking a vector does not reallocate, so this
@@ -799,8 +827,7 @@ namespace waypositor {
           return;
         case State::FINISHED:
           this->frame().mState = State::OBJECT_ID;
-          //this->coreturn();
-          this->suspend();
+          this->coreturn(this->frame().mObjectId, this->frame().mOpcode);
           return;
         }
       }
@@ -811,7 +838,7 @@ namespace waypositor {
   private:
     struct ParseResult {};
 
-    enum class State { WORKING, GOT_DATA };
+    enum class State { WORKING, GOT_DATA, ERROR };
     State mState{State::WORKING};
     uint32_t mObjectId;
     uint16_t mOpcode;
@@ -828,8 +855,11 @@ namespace waypositor {
       void resume() {
         switch (this->frame().mState) {
         case State::WORKING:
-          this->frame().mState = State::GOT_DATA;
+          this->frame().mState = State::ERROR;
           this->template coinvoke<HeaderParser, ParseResult>();
+          return;
+        case State::ERROR:
+          // Do nothing;
           return;
         case State::GOT_DATA:
           this->log_info("Finished parsing header");
@@ -837,6 +867,7 @@ namespace waypositor {
           this->log_info("Object ID: ", this->frame().mObjectId);
           this->log_info("Opcode: ", this->frame().mOpcode);
           this->frame().mState = State::WORKING;
+          this->suspend();
           return;
         }
       }
@@ -845,6 +876,7 @@ namespace waypositor {
     void coreturn(ParseResult, uint32_t object_id, uint16_t opcode) {
       mObjectId = object_id;
       mOpcode = opcode;
+      mState = State::GOT_DATA;
     }
   };
 
