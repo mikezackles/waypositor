@@ -239,7 +239,7 @@ namespace waypositor {
         >
         void coinvoke(Args&&... args) {
           assert(*this);
-          mStack->call<U, MyReturnTag, MyLogic>(
+          mStack->call<Context, U, MyReturnTag, MyLogic>(
             // Transfer ownership of this stack pointer back to the stack
             std::move(*this)
           , std::forward<Args>(args)...
@@ -600,6 +600,25 @@ namespace waypositor {
         mSelf.context().post(std::move(static_cast<Logic &>(*this)));
       }
 
+      // Invoke a new coroutine
+      template <
+        // The frame data for the coroutine. This type should define a type
+        // U::Logic<FramePointer> that accepts ownership of the FramePointer
+        // created by this function in its constructor. It should also define
+        // a member function U::coreturn(ReturnTag, ...)
+        typename U
+      , // The tag the child logic should use when invoking coreturn on the
+        // frame data
+        typename ReturnTag
+      , // Arguments for constructing the frame data
+        typename ...Args
+      >
+      void coinvoke(Args&&... args) {
+        mSelf.template coinvoke<U, ReturnTag, Logic>(
+          std::forward<Args>(args)...
+        );
+      }
+
       template <typename ...Args>
       void coreturn(Args&&... args) {
         mSelf.coreturn(std::forward<Args>(args)...);
@@ -746,7 +765,7 @@ namespace waypositor {
   //  }
   //};
 
-  class Dispatcher final {
+  class HeaderParser final {
   private:
     enum class State { OBJECT_ID, OPCODE, MESSAGE_SIZE, FINISHED };
     State mState{State::OBJECT_ID};
@@ -756,10 +775,10 @@ namespace waypositor {
 
   public:
     template <typename StackPointer>
-    class Logic : public coroutine::LogicMixin<Dispatcher, StackPointer> {
+    class Logic : public coroutine::LogicMixin<HeaderParser, StackPointer> {
     public:
       Logic(StackPointer frame_pointer)
-        : coroutine::LogicMixin<Dispatcher, StackPointer>(
+        : coroutine::LogicMixin<HeaderParser, StackPointer>(
             std::move(frame_pointer)
           )
       {}
@@ -779,10 +798,6 @@ namespace waypositor {
           this->async_read(this->frame().mMessageSize);
           return;
         case State::FINISHED:
-          this->log_info("Finished parsing header");
-          this->log_info("Object ID: ", this->frame().mObjectId);
-          this->log_info("Message Size: ", this->frame().mMessageSize);
-          this->log_info("Opcode: ", this->frame().mOpcode);
           this->frame().mState = State::OBJECT_ID;
           //this->coreturn();
           this->suspend();
@@ -790,6 +805,47 @@ namespace waypositor {
         }
       }
     };
+  };
+
+  class Dispatcher final {
+  private:
+    struct ParseResult {};
+
+    enum class State { WORKING, GOT_DATA };
+    State mState{State::WORKING};
+    uint32_t mObjectId;
+    uint16_t mOpcode;
+  public:
+    template <typename StackPointer>
+    class Logic : public coroutine::LogicMixin<Dispatcher, StackPointer> {
+    public:
+      Logic(StackPointer frame_pointer)
+        : coroutine::LogicMixin<Dispatcher, StackPointer>(
+            std::move(frame_pointer)
+          )
+      {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::WORKING:
+          this->frame().mState = State::GOT_DATA;
+          this->template coinvoke<HeaderParser, ParseResult>();
+          return;
+        case State::GOT_DATA:
+          this->log_info("Finished parsing header");
+          //this->log_info("Message Size: ", this->frame().mMessageSize);
+          this->log_info("Object ID: ", this->frame().mObjectId);
+          this->log_info("Opcode: ", this->frame().mOpcode);
+          this->frame().mState = State::WORKING;
+          return;
+        }
+      }
+    };
+
+    void coreturn(ParseResult, uint32_t object_id, uint16_t opcode) {
+      mObjectId = object_id;
+      mOpcode = opcode;
+    }
   };
 
   class Listener final {
