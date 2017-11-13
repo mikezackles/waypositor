@@ -348,7 +348,8 @@ namespace waypositor {
         {}
 
         // Dispatch the coreturn call to the parent pointer
-        ParentPointer *operator->() { return &mParentPointer; }
+        ParentPointer &operator->() { return mParentPointer; }
+        ParentPointer const &operator->() const { return mParentPointer; }
       };
 
       struct Private {};
@@ -599,6 +600,11 @@ namespace waypositor {
         mSelf.context().post(std::move(static_cast<Logic &>(*this)));
       }
 
+      template <typename ...Args>
+      void coreturn(Args&&... args) {
+        mSelf.coreturn(std::forward<Args>(args)...);
+      }
+
       State &frame() { return *mSelf; }
       State const &frame() const { return *mSelf; }
     };
@@ -778,6 +784,7 @@ namespace waypositor {
           this->log_info("Message Size: ", this->frame().mMessageSize);
           this->log_info("Opcode: ", this->frame().mOpcode);
           this->frame().mState = State::OBJECT_ID;
+          //this->coreturn();
           this->suspend();
           return;
         }
