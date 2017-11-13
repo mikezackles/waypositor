@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <system_error>
+#include <tuple>
 #include <unordered_map>
 #include <experimental/filesystem>
 
@@ -455,7 +456,7 @@ namespace waypositor {
       // This represents the Stack's ownership of an Entry. If it goes out of
       // scope, it attempts to remove the associated Entry from its owning
       // Lookup instance, assuming the Lookup instance still exists.
-      class KeepaliveHandle {
+      class KeepaliveHandle final {
       private:
         std::shared_ptr<Entry> mEntry;
       public:
@@ -499,7 +500,7 @@ namespace waypositor {
           mEntry->context.shutdown();
         }
 
-        OwnerHandle(std::shared_ptr<Entry> entry)
+        explicit OwnerHandle(std::shared_ptr<Entry> entry)
           : mEntry{std::move(entry)}
         {}
       };
@@ -616,6 +617,7 @@ namespace waypositor {
         static_cast<Logic *>(this)->resume();
       }
 
+    protected:
       template <typename Destination>
       void async_read(Destination &destination) {
         mSelf.context().async_read(
@@ -659,6 +661,12 @@ namespace waypositor {
 
       State &frame() { return *mSelf; }
       State const &frame() const { return *mSelf; }
+    };
+
+    template <typename Derived>
+    struct FrameMixin {
+      template <typename StackPointer>
+      using LogicMixin = LogicMixin<Derived, StackPointer>;
     };
   }
 
@@ -799,8 +807,8 @@ namespace waypositor {
   //};
 
   // It might be more efficient to read this in one fell swoop instead of one
-  // field at a time, but for now this is easier.
-  class HeaderParser final {
+  // field at a time, but for now this both readable and portable.
+  class HeaderParser final : private coroutine::FrameMixin<HeaderParser> {
   private:
     enum class State { OBJECT_ID, OPCODE, MESSAGE_SIZE, FINISHED };
     State mState{State::OBJECT_ID};
@@ -810,13 +818,9 @@ namespace waypositor {
 
   public:
     template <typename StackPointer>
-    class Logic : public coroutine::LogicMixin<HeaderParser, StackPointer> {
+    class Logic : public LogicMixin<StackPointer> {
     public:
-      Logic(StackPointer frame_pointer)
-        : coroutine::LogicMixin<HeaderParser, StackPointer>(
-            std::move(frame_pointer)
-          )
-      {}
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
 
       void resume() {
         switch (this->frame().mState) {
@@ -841,7 +845,7 @@ namespace waypositor {
     };
   };
 
-  class Dispatcher final {
+  class Dispatcher final : private coroutine::FrameMixin<Dispatcher> {
   private:
     struct ParseResult {};
 
@@ -850,14 +854,11 @@ namespace waypositor {
     uint32_t mObjectId;
     uint16_t mOpcode;
   public:
+
     template <typename StackPointer>
-    class Logic : public coroutine::LogicMixin<Dispatcher, StackPointer> {
+    class Logic : public LogicMixin<StackPointer> {
     public:
-      Logic(StackPointer frame_pointer)
-        : coroutine::LogicMixin<Dispatcher, StackPointer>(
-            std::move(frame_pointer)
-          )
-      {}
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
 
       void resume() {
         switch (this->frame().mState) {
