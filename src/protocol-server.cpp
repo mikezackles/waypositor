@@ -542,6 +542,11 @@ namespace waypositor {
       , std::tuple<CoroArgs...> coro_args
       , std::index_sequence<CoroIndices...>
       ) {
+        // gcc reports unused-but-set warnings when these tuples are empty.
+        // Suppress them.
+        (void)context_args;
+        (void)coro_args;
+
         // Make a shared pointer to the context
         auto pointer = std::make_shared<Entry>(
           // Pass the id to the context constructor. (Useful for logging.)
