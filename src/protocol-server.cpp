@@ -20,8 +20,34 @@ namespace waypositor {
   namespace asio = boost::asio;
   using Domain = asio::local::stream_protocol;
 
-  class Connection {
+  class Connection final {
+  private:
+    class Sync final {
+    private:
+      std::atomic<uint32_t> mCallbackId{1};
+      Connection &mConnection;
+    public:
+      Connection &connection() { return mConnection; }
+      void set_callback(uint32_t callback_id) { mCallbackId = callback_id; }
+      Sync(Connection &connection) : mConnection{connection} {}
+      ~Sync() {
+        // This is owned by a std::shared_ptr: there can no longer be concurrent
+        // access
+        uint32_t callback_id = mCallbackId;
+        // 1 is the id of the display singleton, so we know it cannot be used
+        // for a callback id
+        if (callback_id == 1) return;
+        mConnection.log_info("SYNC: ", callback_id);
+        // TODO - Emit sync event
+      }
+    };
   public:
+    class Dispatchable {
+    public:
+      virtual void dispatch(std::shared_ptr<Sync> sync, uint16_t opcode) = 0;
+      virtual ~Dispatchable() = default;
+    };
+
     Connection(
       std::size_t id, Logger &log, asio::io_service &asio
     , Domain::socket socket
@@ -58,12 +84,50 @@ namespace waypositor {
       mSocket = std::nullopt;
     }
 
+    template <typename T, typename ...Args>
+    void create(uint32_t id, Args&&... args) {
+      auto lock = std::lock_guard(mDispatchablesMutex);
+      mDispatchables.emplace(
+        id, std::make_unique<T>(std::forward<Args>(args)...)
+      );
+    }
+
+    void destroy(uint32_t id) {
+      auto lock = std::lock_guard(mDispatchablesMutex);
+      mDispatchables.erase(id);
+    }
+
+    void sync(uint32_t callback_id) {
+      // Signal which callback id to use for emitting a sync event.
+      mSync->set_callback(callback_id);
+      // Destroy the previous Sync instance and replace it with a new one. Every
+      // dispatch has shared ownership of a Sync instance via a shared_ptr.
+      // Destroying the Connection's Sync pointer means that the moment all
+      // outstanding dispatches complete, a sync event will be emitted.
+      mSync = std::make_shared<Sync>(*this);
+    }
+
+    void dispatch(uint32_t object_id, uint16_t opcode) {
+      auto lock = std::lock_guard(mDispatchablesMutex);
+      if (auto it = mDispatchables.find(object_id);
+          it != mDispatchables.end()) {
+        it->second->dispatch(mSync, opcode);
+      } else {
+        // Error
+      }
+    }
+
   private:
     std::size_t mId;
     Logger &mLog;
     asio::io_service &mAsio;
     std::optional<Domain::socket> mSocket;
-    std::mutex mSocketMutex;
+    std::mutex mSocketMutex{};
+    std::unordered_map<
+      uint32_t, std::unique_ptr<Dispatchable>
+    > mDispatchables{};
+    std::mutex mDispatchablesMutex{};
+    std::shared_ptr<Sync> mSync{std::make_shared<Sync>(*this)};
   };
 
   namespace coroutine {
@@ -752,19 +816,10 @@ namespace waypositor {
   //}
 
   //template <typename Continuation>
-  //class Dispatchable {
-  //public:
-  //  virtual bool dispatch(
-  //    Continuation continuation, uint16_t opcode
-  //  ) = 0;
-  //  virtual ~Dispatchable() = default;
-  //};
-
-  //template <typename Continuation>
   //class Display final : public Dispatchable<Continuation> {
   //private:
   //  std::unordered_map<
-  //    uint32_t, std::unique_ptr<Dispatchable<Continuation>>
+  //    uint32_t, std::unique_ptr<Dispatchable>
   //  > mTable{};
   //  events::Display mEvents{};
   //  requests::Display mRequests{};
