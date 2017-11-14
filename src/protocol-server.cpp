@@ -64,7 +64,7 @@ namespace waypositor {
         template <typename ...Args>
         Frame(ParentPointer parent_pointer, Args&&... args)
           : mParentPointer{std::move(parent_pointer)}
-          , mData{std::forward<Args>(args)...}
+          , mData(std::forward<Args>(args)...)
         {}
 
         // Dereferencing these on anything but the active frame is bad news!
@@ -185,15 +185,18 @@ namespace waypositor {
         , // A callable type that manipulates the frame data via the stack
           // pointer. It maintains ownership of the active frame pointer.
           typename MyLogic
-        , // Arguments for constructing the frame data
+        , // Arguments for constructing the frame data. These are copied to
+          // avoid inadvertently referencing into a stack that gets resized.
+          // (Note that this doesn't prevent transferring ownership via
+          // std::move.)
           typename ...Args
         >
-        void coinvoke(Args&&... args) {
+        void coinvoke(Args... args) {
           assert(*this);
           mStack->call<Context, U, MyReturnTag, MyLogic>(
             // Transfer ownership of this stack pointer back to the stack
             std::move(*this)
-          , std::forward<Args>(args)...
+          , std::move(args)...
           );
         }
 
@@ -242,7 +245,8 @@ namespace waypositor {
         std::size_t offset = mStore.size();
         std::size_t aligned = (offset + mask) & ~mask;
 
-        // Make space
+        // Make space. This invalidates anything referencing into the existing
+        // stack!!
         mStore.resize(aligned + sizeof(FrameT));
 
         // Construct a frame
@@ -625,6 +629,8 @@ namespace waypositor {
 
       uint32_t next_serial() { return mSelf.context().next_serial(); }
 
+      void sync(uint32_t callback_id) { mSelf.context().sync(callback_id); }
+
       State &frame() { return *mSelf; }
       State const &frame() const { return *mSelf; }
     };
@@ -780,7 +786,12 @@ namespace waypositor {
     ) : mId{id}, mLog{log}, mAsio{asio}
       , mSocket{std::move(socket)}
     { this->log_info("Accepted"); }
-    ~Connection() { this->log_info("Destroyed"); }
+    ~Connection() {
+      // Hack to avoid honoring an outstanding sync if the entire connection is
+      // coming down
+      mSync.set_callback(1);
+      this->log_info("Destroyed");
+    }
 
     template <typename Callback>
     void post(Callback &&callback) {
@@ -842,13 +853,13 @@ namespace waypositor {
     void coreturn(SyncReturnTag) { /* Do nothing */ }
 
     void sync(uint32_t callback_id) {
-      // Signal which callback id to use for emitting a sync event.
-      mSync.set_callback(callback_id);
       // Destroy the previous Sync instance and replace it with a new one. Every
       // dispatch has shared ownership of a Sync instance via a shared_ptr.
       // Destroying the Connection's Sync pointer means that the moment all
       // outstanding dispatches complete, a sync event will be emitted.
       mSync = Sync(*this);
+      // Signal which callback id to use for emitting a sync event.
+      mSync.set_callback(callback_id);
     }
 
     void dispatch(uint32_t object_id, uint16_t opcode) {
@@ -1052,7 +1063,8 @@ namespace waypositor {
     }
   };
 
-  class GetRegistry final : private coroutine::FrameMixin<GetRegistry> {
+  class GetRegistryRequest final
+    : private coroutine::FrameMixin<GetRegistryRequest> {
   private:
     enum class State { ID, FINISHED };
     State mState{State::ID};
@@ -1079,16 +1091,65 @@ namespace waypositor {
     };
   };
 
+  class DisplayDispatch final : private coroutine::FrameMixin<DisplayDispatch> {
+  private:
+    enum class State { DISPATCH, PARSE_SYNC, SYNC_DONE };
+    State mState{State::DISPATCH};
+    uint16_t mOpcode;
+    uint32_t mSyncCallbackId;
+
+  public:
+    DisplayDispatch(uint16_t opcode) : mOpcode{opcode} {}
+
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      // Sync is a special case. We do it here out of laziness :)
+      void resume() {
+        switch (this->frame().mState) {
+        case State::DISPATCH:
+          switch (this->frame().mOpcode) {
+          case 0: // sync
+            this->log_info("display::sync");
+            this->frame().mState = State::PARSE_SYNC;
+            break;
+          case 1: // get registry
+            this->log_info("display::get_registry");
+            this->template spawn<GetRegistryRequest>();
+            this->coreturn();
+            return;
+          default:
+            this->log_error("Invalid opcode for Display");
+            this->log_error("TODO - report this to client");
+            this->coreturn();
+            return;
+          }
+        case State::PARSE_SYNC:
+          this->frame().mState = State::SYNC_DONE;
+          this->async_read(this->frame().mSyncCallbackId);
+          return;
+        case State::SYNC_DONE:
+          this->log_info("Sync requested: ", this->frame().mSyncCallbackId);
+          this->sync(this->frame().mSyncCallbackId);
+          this->coreturn();
+          return;
+        }
+      }
+    };
+  };
+
   class Dispatcher final : private coroutine::FrameMixin<Dispatcher> {
   private:
-    struct ParseResult {};
+    struct DispatchResult {};
+    struct HeaderResult {};
 
-    enum class State { PARSE, GOT_DATA, ERROR };
+    enum class State { PARSE, GOT_HEADER, ERROR };
     State mState{State::PARSE};
     uint32_t mObjectId;
     uint16_t mOpcode;
   public:
-
     template <typename StackPointer>
     class Logic : public LogicMixin<StackPointer> {
     public:
@@ -1096,7 +1157,7 @@ namespace waypositor {
 
       void resume() {
         switch (this->frame().mState) {
-        case State::GOT_DATA:
+        case State::GOT_HEADER:
           this->log_info(
             "Request ["
           , "object: ", this->frame().mObjectId, ", "
@@ -1104,28 +1165,18 @@ namespace waypositor {
           , "]"
           );
           if (this->frame().mObjectId == 1) {
-            // Process requests to the display singleton inline
-            switch (this->frame().mOpcode) {
-            case 0: // sync
-              this->log_info("display::sync");
-              break;
-            case 1: // get registry
-              this->log_info("display::get_registry");
-              this->template spawn<GetRegistry>();
-              break;
-            default:
-              this->log_error("Invalid opcode for Display");
-              this->log_error("TODO - report this to client");
-              break;
-            }
+            this->frame().mState = State::ERROR;
+            this->template coinvoke<DisplayDispatch, DispatchResult>(
+              this->frame().mOpcode
+            );
+            return;
           } else {
             this->dispatch(this->frame().mObjectId, this->frame().mOpcode);
           }
           // Fall through
         case State::PARSE:
-          // It's an error if we resume without getting a return value
           this->frame().mState = State::ERROR;
-          this->template coinvoke<HeaderParser, ParseResult>();
+          this->template coinvoke<HeaderParser, HeaderResult>();
           return;
         case State::ERROR:
           // Do nothing;
@@ -1134,10 +1185,12 @@ namespace waypositor {
       }
     };
 
-    void coreturn(ParseResult, uint32_t object_id, uint16_t opcode) {
+    void coreturn(DispatchResult) { mState = State::PARSE; }
+
+    void coreturn(HeaderResult, uint32_t object_id, uint16_t opcode) {
       mObjectId = object_id;
       mOpcode = opcode;
-      mState = State::GOT_DATA;
+      mState = State::GOT_HEADER;
     }
   };
 
