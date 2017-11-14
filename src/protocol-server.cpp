@@ -14,126 +14,17 @@
 #include <boost/asio/local/stream_protocol.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/signal_set.hpp>
+#include <boost/asio/write.hpp>
 
 namespace waypositor {
   namespace filesystem = std::experimental::filesystem;
   namespace asio = boost::asio;
   using Domain = asio::local::stream_protocol;
 
-  class Connection final {
-  private:
-    class Sync final {
-    private:
-      std::atomic<uint32_t> mCallbackId{1};
-      Connection &mConnection;
-    public:
-      Connection &connection() { return mConnection; }
-      void set_callback(uint32_t callback_id) { mCallbackId = callback_id; }
-      Sync(Connection &connection) : mConnection{connection} {}
-      ~Sync() {
-        // This is owned by a std::shared_ptr: there can no longer be concurrent
-        // access
-        uint32_t callback_id = mCallbackId;
-        // 1 is the id of the display singleton, so we know it cannot be used
-        // for a callback id
-        if (callback_id == 1) return;
-        mConnection.log_info("SYNC: ", callback_id);
-        // TODO - Emit sync event
-      }
-    };
-  public:
-    class Dispatchable {
-    public:
-      virtual void dispatch(std::shared_ptr<Sync> sync, uint16_t opcode) = 0;
-      virtual ~Dispatchable() = default;
-    };
-
-    Connection(
-      std::size_t id, Logger &log, asio::io_service &asio
-    , Domain::socket socket
-    ) : mId{id}, mLog{log}, mAsio{asio}
-      , mSocket{std::move(socket)}
-    { this->log_info("Accepted"); }
-    ~Connection() { this->log_info("Destroyed"); }
-
-    template <typename Callback>
-    void post(Callback &&callback) {
-      mAsio.post(std::move(callback));
-    }
-
-    template <typename Buffers, typename Continuation>
-    void async_read(Buffers &&buffers, Continuation continuation) {
-      auto lock = std::lock_guard(mSocketMutex);
-      asio::async_read(
-        *mSocket, buffers, std::move(continuation)
-      );
-    }
-
-    template <typename ...Args>
-    void log_info(Args&&... args) {
-      mLog.info("(Connection ", mId, ") ", std::forward<Args>(args)...);
-    }
-
-    template <typename ...Args>
-    void log_error(Args&&... args) {
-      mLog.error("(Connection ", mId, ") ", std::forward<Args>(args)...);
-    }
-
-    void shutdown() {
-      auto lock = std::lock_guard(mSocketMutex);
-      mSocket = std::nullopt;
-    }
-
-    template <typename T, typename ...Args>
-    void create(uint32_t id, Args&&... args) {
-      auto lock = std::lock_guard(mDispatchablesMutex);
-      mDispatchables.emplace(
-        id, std::make_unique<T>(std::forward<Args>(args)...)
-      );
-    }
-
-    void destroy(uint32_t id) {
-      auto lock = std::lock_guard(mDispatchablesMutex);
-      mDispatchables.erase(id);
-    }
-
-    void sync(uint32_t callback_id) {
-      // Signal which callback id to use for emitting a sync event.
-      mSync->set_callback(callback_id);
-      // Destroy the previous Sync instance and replace it with a new one. Every
-      // dispatch has shared ownership of a Sync instance via a shared_ptr.
-      // Destroying the Connection's Sync pointer means that the moment all
-      // outstanding dispatches complete, a sync event will be emitted.
-      mSync = std::make_shared<Sync>(*this);
-    }
-
-    void dispatch(uint32_t object_id, uint16_t opcode) {
-      auto lock = std::lock_guard(mDispatchablesMutex);
-      if (auto it = mDispatchables.find(object_id);
-          it != mDispatchables.end()) {
-        it->second->dispatch(mSync, opcode);
-      } else {
-        // Error
-      }
-    }
-
-  private:
-    std::size_t mId;
-    Logger &mLog;
-    asio::io_service &mAsio;
-    std::optional<Domain::socket> mSocket;
-    std::mutex mSocketMutex{};
-    std::unordered_map<
-      uint32_t, std::unique_ptr<Dispatchable>
-    > mDispatchables{};
-    std::mutex mDispatchablesMutex{};
-    std::shared_ptr<Sync> mSync{std::make_shared<Sync>(*this)};
-  };
-
   namespace coroutine {
     // A type-safe coroutine stack! After creation, this shouldn't allocate
     // except if the stack needs to grow. Suspend/resume amounts to copying a
-    // single pointer through the thread pool's queues.
+    // pointer and an offset through the thread pool's queues.
     //
     // This stack aims to be provably correct because only one
     // (non-moved-from) stack pointer can exist at a time. Ownership must be
@@ -160,27 +51,19 @@ namespace waypositor {
         >
       >;
       Store mStore{};
-
-      // The offset of the currently active stack frame
-      std::size_t mOffset{0};
        
       // A type for representing a stack frame
       template <typename T, typename ParentPointer>
       class Frame final {
       private:
-        // The offset of the parent stack frame
-        std::size_t mParentOffset;
         // The parent frame's stack pointer, or equivalent for the root pointer
         ParentPointer mParentPointer;
         // The frame data
         T mData;
       public:
         template <typename ...Args>
-        Frame(
-          std::size_t parent_offset
-        , ParentPointer parent_pointer, Args&&... args
-        ) : mParentOffset{parent_offset}
-          , mParentPointer{std::move(parent_pointer)}
+        Frame(ParentPointer parent_pointer, Args&&... args)
+          : mParentPointer{std::move(parent_pointer)}
           , mData{std::forward<Args>(args)...}
         {}
 
@@ -188,22 +71,9 @@ namespace waypositor {
         ParentPointer &parent_pointer() { return mParentPointer; }
         ParentPointer const &parent_pointer() const { return mParentPointer; }
 
-        std::size_t parent_offset() const { return mParentOffset; }
         T &data() { return mData; }
         T const &data() const { return mData; }
       };
-
-      // Get a reference to the current frame
-      template <typename T, typename ParentPointer>
-      auto &frame() {
-        return reinterpret_cast<Frame<T, ParentPointer> &>(mStore[mOffset]);
-      }
-
-      // Get a const reference to the current frame
-      template <typename T, typename ParentPointer>
-      auto const &frame() const {
-        return reinterpret_cast<Frame<T, ParentPointer> &>(mStore[mOffset]);
-      }
 
       // Get a reference to a specific frame
       template <typename T, typename ParentPointer>
@@ -248,38 +118,25 @@ namespace waypositor {
       class Pointer final {
       private:
         Stack *mStack;
+        std::size_t mOffset;
 
         auto &frame() {
-          return mStack->frame<T, ParentPointer>();
+          return mStack->frame<T, ParentPointer>(mOffset);
         }
 
         auto const &frame() const {
-          return mStack->frame<T, ParentPointer>();
-        }
-
-        auto &parent_frame(std::size_t offset) {
-          return mStack->frame<
-            typename ParentPointer::Type, typename ParentPointer::Parent
-          >(offset);
-        }
-
-        auto const &parent_frame(std::size_t offset) const {
-          return mStack->frame<
-            typename ParentPointer::Type, typename ParentPointer::Parent
-          >(offset);
+          return mStack->frame<T, ParentPointer>(mOffset);
         }
       public:
-        using Type = T;
-        using Parent = ParentPointer;
-
         Pointer(Pointer const &);
         Pointer &operator=(Pointer const &);
         Pointer(Pointer &&other)
-          : mStack{other.mStack}
+          : mStack{other.mStack}, mOffset{other.mOffset}
         { other.mStack = nullptr; }
         Pointer &operator=(Pointer &&other) {
           if (this == &other) return *this;
           mStack = other.mStack;
+          mOffset = other.mOffset;
           other.mStack = nullptr;
           return *this;
         }
@@ -287,10 +144,11 @@ namespace waypositor {
           if (!*this) return;
           // The frame pointer has gone out of scope. Reactivate the parent
           // frame, or trigger the stack completion callback.
-          mStack->pop<T, ParentLogic, ParentPointer>();
+          mStack->pop<T, ParentLogic, ParentPointer>(mOffset);
         }
 
-        Pointer(Stack &stack) : mStack{&stack} {}
+        Pointer(Stack &stack, std::size_t offset)
+          : mStack{&stack}, mOffset{offset} {}
 
         explicit operator bool() const { return mStack != nullptr; }
 
@@ -305,11 +163,11 @@ namespace waypositor {
         template <typename ...Args>
         void coreturn(Args&&... args) {
           assert(*this);
-          // Reach into the parent frame to call coreturn. This (the frame data)
-          // is where coroutines should define their coreturn callbacks. The
-          // ReturnTag allows the parent frame to invoke multiple coroutines
-          // with different coreturn callbacks.
-          this->parent_frame(this->frame().parent_offset()).data().coreturn(
+          // Reach through the parent pointer to call coreturn. Usually this
+          // means calling it on the frame data. The ReturnTag allows the parent
+          // frame to invoke multiple coroutines with different coreturn
+          // callbacks.
+          this->frame().parent_pointer()->coreturn(
             ReturnTag{}, std::forward<Args>(args)...
           );
         }
@@ -351,14 +209,12 @@ namespace waypositor {
 
       // Destroy the current stack frame and reactivate the logic for its parent
       template <typename T, typename ParentLogic, typename ParentPointer>
-      void pop() {
+      void pop(std::size_t offset) {
         using FrameT = Frame<T, ParentPointer>;
         // Get the current frame
-        FrameT &doomed = this->frame<T, ParentPointer>();
-        // The current offset will be the new size of the stack after the pop
-        std::size_t new_size = mOffset;
-        // Reset the offset to the offset of the parent frame
-        mOffset = doomed.parent_offset();
+        FrameT &doomed = this->frame<T, ParentPointer>(offset);
+        // The new size of the stack after the pop
+        std::size_t new_size = offset + sizeof(FrameT);
         // Reactivate the parent frame's logic, and pass it ownership of the
         // parent's frame pointer
         ParentLogic logic{std::move(doomed.parent_pointer())};
@@ -366,9 +222,7 @@ namespace waypositor {
         doomed.~FrameT();
         // Resize the stack. Shrinking a vector does not reallocate, so this
         // space remains free for reuse. (We could probably get away without
-        // doing an explicit resize.) Note that a push followed by a pop does
-        // not guarantee that the store has the same size: It may be left with
-        // some extra padding.
+        // doing an explicit resize.)
         mStore.resize(new_size);
         // Resume the parent frame. If this is the root frame it may destroy the
         // stack!
@@ -393,17 +247,14 @@ namespace waypositor {
 
         // Construct a frame
         new (&mStore[aligned]) FrameT(
-          mOffset, std::move(parent_pointer), std::forward<Args>(args)...
+          std::move(parent_pointer), std::forward<Args>(args)...
         );
-
-        // Update the offset
-        mOffset = aligned;
 
         // Create a frame pointer and pass ownership to T's Logic callback
         using PointerT = Pointer<
           Context, T, ReturnTag, ParentLogic, ParentPointer
         >;
-        typename T::template Logic<PointerT>{PointerT{*this}}();
+        typename T::template Logic<PointerT>{PointerT{*this, aligned}}();
       }
 
       // This object lives in the root stack frame. When the call stack
@@ -419,7 +270,6 @@ namespace waypositor {
         // std::nullopt if none was supplied
         ParentPointer mParentPointer;
       public:
-
         // Type for extracting the parent pointer and passing it along to a
         // ParentLogic instance.
         template <typename ParentLogic>
@@ -443,6 +293,18 @@ namespace waypositor {
         // Dispatch the coreturn call to the parent pointer
         ParentPointer &operator->() { return mParentPointer; }
         ParentPointer const &operator->() const { return mParentPointer; }
+      };
+
+      // Helpers for constructing a one-off stack with no parent pointer
+      struct NullTag {};
+      struct NullPointer {
+        NullPointer *operator->() { return this; }
+        NullPointer const *operator->() const { return this; }
+        void coreturn(NullTag) {}
+      };
+      struct NullLogic {
+        NullLogic(NullPointer) {}
+        void operator()() {}
       };
 
       struct Private {};
@@ -485,6 +347,24 @@ namespace waypositor {
         , typename RootPointer<ParentPointer>::template Logic<ParentLogic>
         >(
           std::move(root_pointer), std::forward<Args>(args)...
+        );
+      }
+
+      // This is like std::thread::detach. It spins up a coroutine stack without
+      // worrying about what happens when it finishes.
+      template <
+        // The coroutine to invoke first
+        typename T
+      , // The stack's special context instance (e.g., Connection)
+        typename Context
+      , // Arguments for constructing the T instance
+        typename ...Args
+      >
+      static void spawn(
+        Context &context, Args&&... args
+      ) {
+        spawn<T, NullTag, NullLogic>(
+          context, NullPointer{}, std::forward<Args>(args)...
         );
       }
     };
@@ -690,6 +570,14 @@ namespace waypositor {
         );
       }
 
+      template <typename Source>
+      void async_write(Source &source) {
+        mSelf.context().async_write(
+          asio::buffer(&source, sizeof(Source))
+        , std::move(static_cast<Logic &>(*this))
+        );
+      }
+
       template <typename ...Args>
       void log_info(Args&&... args) {
         mSelf.context().log_info(std::forward<Args>(args)...);
@@ -723,6 +611,8 @@ namespace waypositor {
         mSelf.coreturn(std::forward<Args>(args)...);
       }
 
+      uint32_t next_serial() { return mSelf.context().next_serial(); }
+
       State &frame() { return *mSelf; }
       State const &frame() const { return *mSelf; }
     };
@@ -733,6 +623,215 @@ namespace waypositor {
       using LogicMixin = LogicMixin<Derived, StackPointer>;
     };
   }
+
+  class SendHeader final : public coroutine::FrameMixin<SendHeader> {
+  private:
+    enum class State { OBJECT_ID, OPCODE, MESSAGE_SIZE, FINISHED };
+    State mState{State::OBJECT_ID};
+    uint32_t mObjectId;
+    uint16_t mOpcode;
+    uint16_t mMessageSize;
+
+  public:
+    SendHeader(uint32_t object_id, uint16_t opcode, uint16_t message_size)
+      : mObjectId{object_id}, mOpcode{opcode}
+      , // Add 8 for the size of this header
+        mMessageSize{
+          static_cast<uint16_t>(
+            sizeof(mObjectId) + sizeof(mOpcode) + sizeof(mMessageSize)
+          + message_size
+          )
+        }
+    {}
+
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::OBJECT_ID:
+          this->async_write(this->frame().mObjectId);
+          return;
+        case State::OPCODE:
+          this->async_write(this->frame().mOpcode);
+          return;
+        case State::MESSAGE_SIZE:
+          this->async_write(this->frame().mMessageSize);
+          return;
+        case State::FINISHED:
+          this->coreturn();
+          return;
+        }
+      }
+    };
+  };
+
+  class SendSync final : public coroutine::FrameMixin<SendSync> {
+  private:
+    enum class State { HEADER, DATA, FINISHED, ERROR };
+    State mState{State::HEADER};
+    uint32_t mCallbackId;
+    uint32_t mSerial;
+  public:
+    SendSync(uint32_t callback_id) : mCallbackId{callback_id} {}
+
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::HEADER:
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<SendHeader, HeaderReturn>(
+            this->frame().mCallbackId, uint16_t(0)
+          , static_cast<uint16_t>(sizeof(uint32_t))
+          );
+          return;
+        case State::ERROR:
+          return;
+        case State::DATA:
+          this->frame().mSerial = this->next_serial();
+          this->frame().mState = State::FINISHED;
+          this->async_write(this->frame().mSerial);
+          return;
+        case State::FINISHED:
+          this->coreturn();
+          return;
+        }
+      }
+    };
+
+    struct HeaderReturn {};
+    void coreturn(HeaderReturn) { mState = State::DATA; }
+  };
+
+  class Connection final {
+  private:
+    class Sync final {
+    private:
+      std::atomic<uint32_t> mCallbackId{1};
+      Connection &mConnection;
+    public:
+      Connection &connection() { return mConnection; }
+      void set_callback(uint32_t callback_id) { mCallbackId = callback_id; }
+      Sync(Connection &connection) : mConnection{connection} {}
+      ~Sync() {
+        // This is owned by a std::shared_ptr: there can no longer be concurrent
+        // access
+        uint32_t callback_id = mCallbackId;
+        // 1 is the id of the display singleton, so we know it cannot be used
+        // for a callback id. This ensures that we don't attempt to emit an
+        // event on shutdown if none was requested.
+        if (callback_id == 1) return;
+        mConnection.log_info("SYNC: ", callback_id);
+
+        // Emit sync event
+        coroutine::Stack::spawn<SendSync>(mConnection, callback_id);
+      }
+    };
+  public:
+    class Dispatchable {
+    public:
+      virtual void dispatch(std::shared_ptr<Sync> sync, uint16_t opcode) = 0;
+      virtual ~Dispatchable() = default;
+    };
+
+    Connection(
+      std::size_t id, Logger &log, asio::io_service &asio
+    , Domain::socket socket
+    ) : mId{id}, mLog{log}, mAsio{asio}
+      , mSocket{std::move(socket)}
+    { this->log_info("Accepted"); }
+    ~Connection() { this->log_info("Destroyed"); }
+
+    template <typename Callback>
+    void post(Callback &&callback) {
+      mAsio.post(std::move(callback));
+    }
+
+    template <typename Buffers, typename Continuation>
+    void async_read(Buffers &&buffers, Continuation continuation) {
+      auto lock = std::lock_guard(mSocketMutex);
+      asio::async_read(
+        *mSocket, buffers, std::move(continuation)
+      );
+    }
+
+    template <typename Buffers, typename Continuation>
+    void async_write(Buffers &&buffers, Continuation continuation) {
+      auto lock = std::lock_guard(mSocketMutex);
+      asio::async_write(
+        *mSocket, buffers, std::move(continuation)
+      );
+    }
+
+    template <typename ...Args>
+    void log_info(Args&&... args) {
+      mLog.info("(Connection ", mId, ") ", std::forward<Args>(args)...);
+    }
+
+    template <typename ...Args>
+    void log_error(Args&&... args) {
+      mLog.error("(Connection ", mId, ") ", std::forward<Args>(args)...);
+    }
+
+    void shutdown() {
+      auto lock = std::lock_guard(mSocketMutex);
+      mSocket = std::nullopt;
+    }
+
+    template <typename T, typename ...Args>
+    void create(uint32_t id, Args&&... args) {
+      auto lock = std::lock_guard(mDispatchablesMutex);
+      mDispatchables.emplace(
+        id, std::make_unique<T>(std::forward<Args>(args)...)
+      );
+    }
+
+    void destroy(uint32_t id) {
+      auto lock = std::lock_guard(mDispatchablesMutex);
+      mDispatchables.erase(id);
+    }
+
+    void sync(uint32_t callback_id) {
+      // Signal which callback id to use for emitting a sync event.
+      mSync->set_callback(callback_id);
+      // Destroy the previous Sync instance and replace it with a new one. Every
+      // dispatch has shared ownership of a Sync instance via a shared_ptr.
+      // Destroying the Connection's Sync pointer means that the moment all
+      // outstanding dispatches complete, a sync event will be emitted.
+      mSync = std::make_shared<Sync>(*this);
+    }
+
+    void dispatch(uint32_t object_id, uint16_t opcode) {
+      auto lock = std::lock_guard(mDispatchablesMutex);
+      if (auto it = mDispatchables.find(object_id);
+          it != mDispatchables.end()) {
+        it->second->dispatch(mSync, opcode);
+      } else {
+        // Error
+      }
+    }
+
+    uint32_t next_serial() { return mEventSerial++; }
+
+  private:
+    std::size_t mId;
+    Logger &mLog;
+    asio::io_service &mAsio;
+    std::optional<Domain::socket> mSocket;
+    std::mutex mSocketMutex{};
+    std::unordered_map<
+      uint32_t, std::unique_ptr<Dispatchable>
+    > mDispatchables{};
+    std::mutex mDispatchablesMutex{};
+    std::shared_ptr<Sync> mSync{std::make_shared<Sync>(*this)};
+    std::atomic<uint32_t> mEventSerial{0};
+  };
 
   //// These are intended to be simple enough to generate with a python script
   //namespace events {
