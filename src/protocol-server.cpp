@@ -302,8 +302,9 @@ namespace waypositor {
         NullPointer const *operator->() const { return this; }
         void coreturn(NullTag) {}
       };
+      template <typename Unused>
       struct NullLogic {
-        NullLogic(NullPointer) {}
+        NullLogic(Unused) {}
         void operator()() {}
       };
 
@@ -314,7 +315,7 @@ namespace waypositor {
         Private // Make the constructor effectively private
       , void *context
       ) : mContext{context}
-      { mStore.reserve(1 << 10); } // Start with a 1KB stack for now
+      { /*mStore.reserve(1 << 10);*/ } // Start with a 1KB stack for now
 
       // Kick off the stack! Note that a stack can be reused if it's empty
       template <
@@ -323,9 +324,6 @@ namespace waypositor {
       , // coreturn will be invoked through the ParentPointer instance using
         // this tag
         typename ParentReturnTag
-      , // As with stack frames, this is the logic type used to take ownership
-        // of the ParentPointer instance
-        typename ParentLogic
       , // The stack's special context instance (e.g., Connection)
         typename Context
       , // This could be frame pointer for another stack, or it could be a
@@ -344,7 +342,9 @@ namespace waypositor {
         };
         stack.template call<
           Context, T, ParentReturnTag
-        , typename RootPointer<ParentPointer>::template Logic<ParentLogic>
+        , typename RootPointer<ParentPointer>::template Logic<
+            NullLogic<ParentPointer>
+          >
         >(
           std::move(root_pointer), std::forward<Args>(args)...
         );
@@ -363,7 +363,7 @@ namespace waypositor {
       static void spawn(
         Context &context, Args&&... args
       ) {
-        spawn<T, NullTag, NullLogic>(
+        spawn<T, NullTag>(
           context, NullPointer{}, std::forward<Args>(args)...
         );
       }
@@ -468,13 +468,6 @@ namespace waypositor {
         }
       };
 
-      // Accepts a KeepaliveHandle and drops it on the floor.
-      class NullLogic final {
-      public:
-        NullLogic(KeepaliveHandle) {}
-        void operator()() {}
-      };
-
       // An internal version of fork to do tuple unpacking
       template <
         typename Coroutine
@@ -509,7 +502,7 @@ namespace waypositor {
 
         // Kick off the associated coroutine stack
         KeepaliveHandle keepalive{std::move(pointer)};
-        Stack::spawn<Coroutine, ReturnTag, NullLogic>(
+        Stack::spawn<Coroutine, ReturnTag>(
           keepalive->context, std::move(keepalive)
         , std::forward<CoroArgs>(std::get<CoroIndices>(coro_args))...
         );
@@ -583,6 +576,11 @@ namespace waypositor {
         mSelf.context().log_info(std::forward<Args>(args)...);
       }
 
+      template <typename ...Args>
+      void log_error(Args&&... args) {
+        mSelf.context().log_error(std::forward<Args>(args)...);
+      }
+
       void suspend() {
         mSelf.context().post(std::move(static_cast<Logic &>(*this)));
       }
@@ -609,6 +607,20 @@ namespace waypositor {
       template <typename ...Args>
       void coreturn(Args&&... args) {
         mSelf.coreturn(std::forward<Args>(args)...);
+      }
+
+      void dispatch(uint32_t object_id, uint16_t opcode) {
+        mSelf.context().dispatch(object_id, opcode);
+      }
+
+      template <typename T, typename ...Args>
+      void create(Args&&... args) {
+        mSelf.context().template create<T>(std::forward<Args>(args)...);
+      }
+
+      template <typename T, typename ...Args>
+      void spawn(Args&&... args) {
+        mSelf.context().template spawn<T>(std::forward<Args>(args)...);
       }
 
       uint32_t next_serial() { return mSelf.context().next_serial(); }
@@ -711,32 +723,54 @@ namespace waypositor {
 
   class Connection final {
   private:
+    struct SyncReturnTag {};
+  public:
     class Sync final {
     private:
-      std::atomic<uint32_t> mCallbackId{1};
-      Connection &mConnection;
-    public:
-      Connection &connection() { return mConnection; }
-      void set_callback(uint32_t callback_id) { mCallbackId = callback_id; }
-      Sync(Connection &connection) : mConnection{connection} {}
-      ~Sync() {
-        // This is owned by a std::shared_ptr: there can no longer be concurrent
-        // access
-        uint32_t callback_id = mCallbackId;
-        // 1 is the id of the display singleton, so we know it cannot be used
-        // for a callback id. This ensures that we don't attempt to emit an
-        // event on shutdown if none was requested.
-        if (callback_id == 1) return;
-        mConnection.log_info("SYNC: ", callback_id);
+      class Impl {
+      private:
+        std::atomic<uint32_t> mCallbackId{1};
+        Connection &mConnection;
 
-        // Emit sync event
-        coroutine::Stack::spawn<SendSync>(mConnection, callback_id);
+      public:
+        Connection &get() { return mConnection; }
+        Connection const &get() const { return mConnection; }
+        void set_callback(uint32_t callback_id) { mCallbackId = callback_id; }
+
+        Impl(Connection &connection) : mConnection{connection} {}
+        ~Impl() {
+          // This is owned by a std::shared_ptr: there can no longer be concurrent
+          // access
+          uint32_t callback_id = mCallbackId;
+          // 1 is the id of the display singleton, so we know it cannot be used
+          // for a callback id. This ensures that we don't attempt to emit an
+          // event on shutdown if none was requested.
+          if (callback_id == 1) return;
+          mConnection.log_info("SYNC: ", callback_id);
+
+          // Emit sync event
+          coroutine::Stack::spawn<SendSync>(mConnection, callback_id);
+        }
+      };
+      std::shared_ptr<Impl> mImpl;
+
+      friend class Connection;
+      void set_callback(uint32_t callback_id) {
+        mImpl->set_callback(callback_id);
       }
+    public:
+      Sync(Connection &connection)
+        : mImpl{std::make_shared<Impl>(connection)}
+      {}
+      Connection *operator->() { return &mImpl->get(); }
+      Connection const *operator->() const { return &mImpl->get(); }
+      Connection &operator*() { return mImpl->get(); }
+      Connection const &operator*() const { return mImpl->get(); }
     };
-  public:
+
     class Dispatchable {
     public:
-      virtual void dispatch(std::shared_ptr<Sync> sync, uint16_t opcode) = 0;
+      virtual void dispatch(Sync sync, uint16_t opcode) = 0;
       virtual ~Dispatchable() = default;
     };
 
@@ -787,9 +821,9 @@ namespace waypositor {
     template <typename T, typename ...Args>
     void create(uint32_t id, Args&&... args) {
       auto lock = std::lock_guard(mDispatchablesMutex);
-      mDispatchables.emplace(
-        id, std::make_unique<T>(std::forward<Args>(args)...)
-      );
+      mDispatchables.emplace(id, std::make_unique<T>(
+        std::forward<Args>(args)...
+      ));
     }
 
     void destroy(uint32_t id) {
@@ -797,14 +831,24 @@ namespace waypositor {
       mDispatchables.erase(id);
     }
 
+    template <typename T, typename ...Args>
+    void spawn(Args&&... args) {
+      auto copy = mSync;
+      coroutine::Stack::spawn<T, SyncReturnTag>(
+        *this, std::move(copy), std::forward<Args>(args)...
+      );
+    }
+
+    void coreturn(SyncReturnTag) { /* Do nothing */ }
+
     void sync(uint32_t callback_id) {
       // Signal which callback id to use for emitting a sync event.
-      mSync->set_callback(callback_id);
+      mSync.set_callback(callback_id);
       // Destroy the previous Sync instance and replace it with a new one. Every
       // dispatch has shared ownership of a Sync instance via a shared_ptr.
       // Destroying the Connection's Sync pointer means that the moment all
       // outstanding dispatches complete, a sync event will be emitted.
-      mSync = std::make_shared<Sync>(*this);
+      mSync = Sync(*this);
     }
 
     void dispatch(uint32_t object_id, uint16_t opcode) {
@@ -829,7 +873,7 @@ namespace waypositor {
       uint32_t, std::unique_ptr<Dispatchable>
     > mDispatchables{};
     std::mutex mDispatchablesMutex{};
-    std::shared_ptr<Sync> mSync{std::make_shared<Sync>(*this)};
+    Sync mSync{*this};
     std::atomic<uint32_t> mEventSerial{0};
   };
 
@@ -999,12 +1043,48 @@ namespace waypositor {
     };
   };
 
+  class Registry final : public Connection::Dispatchable {
+  public:
+    void dispatch(
+      Connection::Sync sync, uint16_t opcode
+    ) override {
+      sync->log_info("Registry request: ", opcode);
+    }
+  };
+
+  class GetRegistry final : private coroutine::FrameMixin<GetRegistry> {
+  private:
+    enum class State { ID, FINISHED };
+    State mState{State::ID};
+    uint32_t mRegistryId;
+
+  public:
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::ID:
+          this->frame().mState = State::FINISHED;
+          this->async_read(this->frame().mRegistryId);
+          return;
+        case State::FINISHED:
+          this->template create<Registry>(this->frame().mRegistryId);
+          this->coreturn();
+          return;
+        }
+      }
+    };
+  };
+
   class Dispatcher final : private coroutine::FrameMixin<Dispatcher> {
   private:
     struct ParseResult {};
 
-    enum class State { WORKING, GOT_DATA, ERROR };
-    State mState{State::WORKING};
+    enum class State { PARSE, GOT_DATA, ERROR };
+    State mState{State::PARSE};
     uint32_t mObjectId;
     uint16_t mOpcode;
   public:
@@ -1017,12 +1097,32 @@ namespace waypositor {
       void resume() {
         switch (this->frame().mState) {
         case State::GOT_DATA:
-          this->log_info("Finished parsing header");
-          //this->log_info("Message Size: ", this->frame().mMessageSize);
-          this->log_info("Object ID: ", this->frame().mObjectId);
-          this->log_info("Opcode: ", this->frame().mOpcode);
+          this->log_info(
+            "Request ["
+          , "object: ", this->frame().mObjectId, ", "
+          , "opcode: ", this->frame().mOpcode
+          , "]"
+          );
+          if (this->frame().mObjectId == 1) {
+            // Process requests to the display singleton inline
+            switch (this->frame().mOpcode) {
+            case 0: // sync
+              this->log_info("display::sync");
+              break;
+            case 1: // get registry
+              this->log_info("display::get_registry");
+              this->template spawn<GetRegistry>();
+              break;
+            default:
+              this->log_error("Invalid opcode for Display");
+              this->log_error("TODO - report this to client");
+              break;
+            }
+          } else {
+            this->dispatch(this->frame().mObjectId, this->frame().mOpcode);
+          }
           // Fall through
-        case State::WORKING:
+        case State::PARSE:
           // It's an error if we resume without getting a return value
           this->frame().mState = State::ERROR;
           this->template coinvoke<HeaderParser, ParseResult>();
