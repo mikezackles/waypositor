@@ -32,6 +32,7 @@
 #include <cstdlib>
 
 #include <optional>
+#include <string_view>
 #include <system_error>
 #include <tuple>
 #include <unordered_map>
@@ -699,12 +700,15 @@ namespace waypositor {
       void resume() {
         switch (this->frame().mState) {
         case State::OBJECT_ID:
+          this->frame().mState = State::OPCODE;
           this->async_write(this->frame().mObjectId);
           return;
         case State::OPCODE:
+          this->frame().mState = State::MESSAGE_SIZE;
           this->async_write(this->frame().mOpcode);
           return;
         case State::MESSAGE_SIZE:
+          this->frame().mState = State::FINISHED;
           this->async_write(this->frame().mMessageSize);
           return;
         case State::FINISHED:
@@ -713,6 +717,69 @@ namespace waypositor {
         }
       }
     };
+  };
+
+  class AnnounceInterface final
+    : public coroutine::FrameMixin<AnnounceInterface> {
+  private:
+    static constexpr uint16_t opcode = 0;
+
+    enum class State { HEADER, ID, INTERFACE, VERSION, FINISHED, ERROR };
+    State mState{State::HEADER};
+    uint32_t mObjectId;
+    uint32_t mInterfaceId;
+    // This is expected to reference a constant string in the data segment.
+    // TODO - figure out if this is enforceable
+    std::string_view mInterface;
+    uint32_t mVersion;
+
+  public:
+    AnnounceInterface(
+      uint32_t object_id, uint32_t interface_id
+    , std::string_view interface, uint32_t version
+    ) : mObjectId{object_id}, mInterfaceId{interface_id}
+      , mInterface{interface}, mVersion{version}
+    {}
+
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::HEADER:
+          this->log_info("Announcing interface ", this->frame().mInterface);
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<SendHeader, HeaderResult>(
+            this->frame().mObjectId, opcode
+          , sizeof(uint32_t) + sizeof(uint32_t) +
+            this->frame().mInterface.size()
+          );
+          return;
+        case State::ERROR:
+          return;
+        case State::ID:
+          this->frame().mState = State::INTERFACE;
+          this->async_write(this->frame().mInterfaceId);
+          return;
+        case State::INTERFACE:
+          this->frame().mState = State::VERSION;
+          this->async_write(this->frame().mInterface);
+          return;
+        case State::VERSION:
+          this->frame().mState = State::FINISHED;
+          this->async_write(this->frame().mVersion);
+          return;
+        case State::FINISHED:
+          this->coreturn();
+          return;
+        }
+      }
+    };
+
+    struct HeaderResult {};
+    void coreturn(HeaderResult) { mState = State::ID; }
   };
 
   class SendSync final : public coroutine::FrameMixin<SendSync> {
@@ -843,6 +910,16 @@ namespace waypositor {
       );
     }
 
+    template <typename Continuation>
+    void async_write(std::string_view message, Continuation continuation) {
+      auto lock = std::lock_guard(mSocketMutex);
+      asio::async_write(
+        *mSocket
+      , asio::buffer(message.data(), message.size())
+      , std::move(continuation)
+      );
+    }
+
     template <typename ...Args>
     void log_info(Args&&... args) {
       mLog.info("(Connection ", mId, ") ", std::forward<Args>(args)...);
@@ -968,7 +1045,7 @@ namespace waypositor {
   class GetRegistryRequest final
     : private coroutine::FrameMixin<GetRegistryRequest> {
   private:
-    enum class State { ID, FINISHED };
+    enum class State { ID, CREATE, COMPOSITOR, FINISHED, ERROR };
     State mState{State::ID};
     uint32_t mRegistryId;
 
@@ -981,16 +1058,30 @@ namespace waypositor {
       void resume() {
         switch (this->frame().mState) {
         case State::ID:
-          this->frame().mState = State::FINISHED;
+          this->frame().mState = State::CREATE;
           this->async_read(this->frame().mRegistryId);
           return;
-        case State::FINISHED:
+        case State::CREATE:
           this->template create<Registry>(this->frame().mRegistryId);
+          // fall through
+        case State::COMPOSITOR:
+          using namespace std::literals;
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<AnnounceInterface, AnnounceResult>(
+            this->frame().mRegistryId, 0, "wl_compositor"sv, 4
+          );
+          return;
+        case State::FINISHED:
           this->coreturn();
+          return;
+        case State::ERROR:
           return;
         }
       }
     };
+
+    struct AnnounceResult {};
+    void coreturn(AnnounceResult) { mState = State::FINISHED; }
   };
 
   class DisplayDispatch final : private coroutine::FrameMixin<DisplayDispatch> {
