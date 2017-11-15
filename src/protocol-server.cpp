@@ -50,6 +50,7 @@ namespace waypositor {
   namespace filesystem = std::experimental::filesystem;
   namespace asio = boost::asio;
   using Domain = asio::local::stream_protocol;
+  using namespace std::literals;
 
   namespace coroutine {
     // A type-safe coroutine stack! After creation, this shouldn't allocate
@@ -599,8 +600,16 @@ namespace waypositor {
 
       template <typename Source>
       void async_write(Source &source) {
+        static_assert(std::is_integral_v<Source>);
         mSelf.context().async_write(
           asio::buffer(&source, sizeof(Source))
+        , std::move(static_cast<Logic &>(*this))
+        );
+      }
+
+      void async_write(std::string_view source) {
+        mSelf.context().async_write(
+          asio::buffer(source.data(), source.size() + 1)
         , std::move(static_cast<Logic &>(*this))
         );
       }
@@ -661,6 +670,8 @@ namespace waypositor {
 
       void sync(uint32_t callback_id) { mSelf.context().sync(callback_id); }
 
+      auto write_lock_guard() { return mSelf.context().write_lock_guard(); }
+
       State &frame() { return *mSelf; }
       State const &frame() const { return *mSelf; }
     };
@@ -679,17 +690,19 @@ namespace waypositor {
     uint32_t mObjectId;
     uint16_t mOpcode;
     uint16_t mMessageSize;
+    static constexpr uint16_t header_size =
+      sizeof(mObjectId) + sizeof(mOpcode) + sizeof(mMessageSize)
+    ;
+
+    static constexpr uint16_t total_size(uint16_t message_size) {
+      return header_size + message_size;
+    }
 
   public:
-    SendHeader(uint32_t object_id, uint16_t opcode, uint16_t message_size)
-      : mObjectId{object_id}, mOpcode{opcode}
-      , // Add 8 for the size of this header
-        mMessageSize{
-          static_cast<uint16_t>(
-            sizeof(mObjectId) + sizeof(mOpcode) + sizeof(mMessageSize)
-          + message_size
-          )
-        }
+    explicit SendHeader(
+      uint32_t object_id, uint16_t opcode, uint16_t message_size
+    ) : mObjectId{object_id}, mOpcode{opcode}
+      , mMessageSize{total_size(message_size)}
     {}
 
     template <typename StackPointer>
@@ -708,6 +721,7 @@ namespace waypositor {
           this->async_write(this->frame().mOpcode);
           return;
         case State::MESSAGE_SIZE:
+          this->log_info("Message size: ", this->frame().mMessageSize);
           this->frame().mState = State::FINISHED;
           this->async_write(this->frame().mMessageSize);
           return;
@@ -717,69 +731,6 @@ namespace waypositor {
         }
       }
     };
-  };
-
-  class AnnounceInterface final
-    : public coroutine::FrameMixin<AnnounceInterface> {
-  private:
-    static constexpr uint16_t opcode = 0;
-
-    enum class State { HEADER, ID, INTERFACE, VERSION, FINISHED, ERROR };
-    State mState{State::HEADER};
-    uint32_t mObjectId;
-    uint32_t mInterfaceId;
-    // This is expected to reference a constant string in the data segment.
-    // TODO - figure out if this is enforceable
-    std::string_view mInterface;
-    uint32_t mVersion;
-
-  public:
-    AnnounceInterface(
-      uint32_t object_id, uint32_t interface_id
-    , std::string_view interface, uint32_t version
-    ) : mObjectId{object_id}, mInterfaceId{interface_id}
-      , mInterface{interface}, mVersion{version}
-    {}
-
-    template <typename StackPointer>
-    class Logic : public LogicMixin<StackPointer> {
-    public:
-      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
-
-      void resume() {
-        switch (this->frame().mState) {
-        case State::HEADER:
-          this->log_info("Announcing interface ", this->frame().mInterface);
-          this->frame().mState = State::ERROR;
-          this->template coinvoke<SendHeader, HeaderResult>(
-            this->frame().mObjectId, opcode
-          , sizeof(uint32_t) + sizeof(uint32_t) +
-            this->frame().mInterface.size()
-          );
-          return;
-        case State::ERROR:
-          return;
-        case State::ID:
-          this->frame().mState = State::INTERFACE;
-          this->async_write(this->frame().mInterfaceId);
-          return;
-        case State::INTERFACE:
-          this->frame().mState = State::VERSION;
-          this->async_write(this->frame().mInterface);
-          return;
-        case State::VERSION:
-          this->frame().mState = State::FINISHED;
-          this->async_write(this->frame().mVersion);
-          return;
-        case State::FINISHED:
-          this->coreturn();
-          return;
-        }
-      }
-    };
-
-    struct HeaderResult {};
-    void coreturn(HeaderResult) { mState = State::ID; }
   };
 
   class SendSync final : public coroutine::FrameMixin<SendSync> {
@@ -910,16 +861,6 @@ namespace waypositor {
       );
     }
 
-    template <typename Continuation>
-    void async_write(std::string_view message, Continuation continuation) {
-      auto lock = std::lock_guard(mSocketMutex);
-      asio::async_write(
-        *mSocket
-      , asio::buffer(message.data(), message.size())
-      , std::move(continuation)
-      );
-    }
-
     template <typename ...Args>
     void log_info(Args&&... args) {
       mLog.info("(Connection ", mId, ") ", std::forward<Args>(args)...);
@@ -980,6 +921,38 @@ namespace waypositor {
 
     uint32_t next_serial() { return mEventSerial++; }
 
+    class WriteLock {
+    private:
+      Connection *mConnection;
+      struct Private {};
+    public:
+      WriteLock(Connection &connection)
+        : mConnection{&connection} {}
+      WriteLock(WriteLock &&other) : mConnection{other.mConnection}
+      { other.mConnection = nullptr; }
+      WriteLock &operator=(WriteLock &&other) {
+        if (this == &other) return *this;
+        mConnection = other.mConnection;
+        other.mConnection = nullptr;
+        return *this;
+      }
+      ~WriteLock() {
+        if (mConnection != nullptr) mConnection->mWriteLock = false;
+      }
+
+      static std::optional<WriteLock> create(Connection &connection) {
+        bool expected = false;
+        auto lock = connection.mWriteLock.compare_exchange_weak(expected, true);
+        if (lock) {
+          return std::make_optional<WriteLock>(connection);
+        } else {
+          return std::nullopt;
+        }
+      }
+    };
+
+    auto write_lock_guard() { return WriteLock::create(*this); }
+
   private:
     std::size_t mId;
     Logger &mLog;
@@ -992,6 +965,202 @@ namespace waypositor {
     std::mutex mDispatchablesMutex{};
     Sync mSync{*this};
     std::atomic<uint32_t> mEventSerial{0};
+    std::atomic<bool> mWriteLock{false};
+  };
+
+  class SendDelete final : public coroutine::FrameMixin<SendDelete> {
+  private:
+    enum class State { WAITING, HEADER, SEND, DONE, ERROR };
+    State mState{State::HEADER};
+    uint32_t mDeletedId;
+    std::optional<Connection::WriteLock> mWriteLock;
+
+    static constexpr uint32_t object_id = 1; // singleton
+    static constexpr uint16_t opcode = 1;
+  public:
+    SendDelete(uint32_t deleted_id) : mDeletedId{deleted_id} {}
+
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::WAITING:
+          this->frame().mWriteLock = this->write_lock_guard();
+          if (!this->frame().mWriteLock) {
+            this->suspend();
+            return;
+          }
+          // Fall through
+        case State::HEADER:
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<SendHeader, HeaderResult>(
+            object_id, opcode, sizeof(this->frame().mDeletedId)
+          );
+          return;
+        case State::SEND:
+          this->frame().mState = State::DONE;
+          this->async_write(this->frame().mDeletedId);
+          return;
+        case State::DONE:
+          this->coreturn();
+          return;
+        case State::ERROR:
+          return;
+        }
+      }
+    };
+
+    struct HeaderResult {};
+    void coreturn(HeaderResult) { mState = State::SEND; }
+  };
+
+  class SendString final : public coroutine::FrameMixin<SendString> {
+  //private:
+  public:
+    enum class State { LENGTH, MESSAGE, PADDING, FINISHED };
+    State mState{State::LENGTH};
+    uint32_t mLength;
+    // This is intended to point at something constexpr
+    std::string_view mMessage;
+    static constexpr uint32_t null_terminator = 1;
+    static constexpr uint32_t mask = 3;
+    static constexpr auto raw_padding = "\0\0\0\0"sv;
+
+    static constexpr uint32_t padded_length(std::string_view data) {
+      uint32_t size = data.size();
+      return (size + null_terminator + mask) & ~mask;
+    }
+
+    static constexpr uint32_t padding_length(std::string_view data) {
+      uint32_t size = data.size();
+      return ~(size + null_terminator + mask) & mask;
+    }
+
+    std::string_view padding() const {
+      return raw_padding.substr(0, padding_length(mMessage));
+    }
+
+  public:
+    static constexpr uint16_t total_length(std::string_view data) {
+      return sizeof(mLength) + padded_length(data);
+    }
+
+    SendString(std::string_view data)
+      : mLength{static_cast<uint32_t>(data.size()) + null_terminator}
+      , mMessage{data}
+    {}
+
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::LENGTH:
+          this->log_info("LEN: ", this->frame().mLength);
+          this->frame().mState = State::MESSAGE;
+          this->async_write(this->frame().mLength);
+          return;
+        case State::MESSAGE:
+          this->frame().mState = State::PADDING;
+          this->async_write(this->frame().mMessage);
+          return;
+        case State::PADDING:
+          this->frame().mState = State::FINISHED;
+          this->async_write(this->frame().padding());
+          return;
+        case State::FINISHED:
+          this->coreturn();
+          return;
+        }
+      }
+    };
+  };
+
+  class AnnounceInterface final
+    : public coroutine::FrameMixin<AnnounceInterface> {
+  private:
+    enum class State { WAITING, HEADER, ID, NAME, VERSION, FINISHED, ERROR };
+    State mState{State::HEADER};
+    uint32_t mObjectId;
+    uint32_t mInterfaceId;
+    std::string_view mInterfaceName;
+    uint32_t mVersion;
+    std::optional<Connection::WriteLock> mWriteLock;
+
+    static constexpr uint16_t opcode = 0;
+
+  public:
+    AnnounceInterface(
+      uint32_t object_id, uint32_t interface_id
+    , std::string_view interface_name, uint32_t version
+    ) : mObjectId{object_id}, mInterfaceId{interface_id}
+      , mInterfaceName{interface_name}, mVersion{version}
+    {}
+
+    template <typename StackPointer>
+    class Logic : public LogicMixin<StackPointer> {
+    public:
+      Logic(StackPointer frame) : LogicMixin<StackPointer>(std::move(frame)) {}
+
+      void resume() {
+        switch (this->frame().mState) {
+        case State::WAITING:
+          this->frame().mWriteLock = this->write_lock_guard();
+          if (!this->frame().mWriteLock) {
+            this->suspend();
+            return;
+          }
+          // Fall through
+        case State::HEADER:
+          this->log_info("Announcing interface ", this->frame().mInterfaceName);
+
+          this->log_info(
+            "String length: "
+          , SendString::total_length(this->frame().mInterfaceName)
+          );
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<SendHeader, HeaderResult>(
+            this->frame().mObjectId, opcode
+          , sizeof(this->frame().mInterfaceId) +
+            SendString::total_length(this->frame().mInterfaceName) +
+            sizeof(this->frame().mVersion)
+          );
+          return;
+        case State::ID:
+          (void)this->frame().mState;
+          (void)this->frame().mVersion;
+          this->frame().mState = State::NAME;
+          this->async_write(this->frame().mInterfaceId);
+          return;
+        case State::NAME:
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<SendString, NameResult>(
+            this->frame().mInterfaceName
+          );
+          return;
+        case State::VERSION:
+          this->frame().mState = State::FINISHED;
+          this->async_write(this->frame().mVersion);
+          return;
+        case State::FINISHED:
+          this->coreturn();
+          return;
+        case State::ERROR:
+          return;
+        }
+      }
+    };
+
+    struct HeaderResult {};
+    void coreturn(HeaderResult) { mState = State::ID; }
+
+    struct NameResult {};
+    void coreturn(NameResult) { mState = State::VERSION; }
   };
 
   // It might be more efficient to read this in one fell swoop instead of one
@@ -1065,10 +1234,9 @@ namespace waypositor {
           this->template create<Registry>(this->frame().mRegistryId);
           // fall through
         case State::COMPOSITOR:
-          using namespace std::literals;
           this->frame().mState = State::ERROR;
           this->template coinvoke<AnnounceInterface, AnnounceResult>(
-            this->frame().mRegistryId, 0, "wl_compositor"sv, 4
+            this->frame().mRegistryId, 1, "wl_compositor"sv, 4
           );
           return;
         case State::FINISHED:
@@ -1086,7 +1254,9 @@ namespace waypositor {
 
   class DisplayDispatch final : private coroutine::FrameMixin<DisplayDispatch> {
   private:
-    enum class State { DISPATCH, PARSE_SYNC, SYNC_DONE };
+    enum class State {
+      DISPATCH, PARSE_SYNC, DELETE_CALLBACK, SYNC_DONE, ERROR
+    };
     State mState{State::DISPATCH};
     uint16_t mOpcode;
     uint32_t mSyncCallbackId;
@@ -1120,17 +1290,28 @@ namespace waypositor {
             return;
           }
         case State::PARSE_SYNC:
-          this->frame().mState = State::SYNC_DONE;
+          this->frame().mState = State::DELETE_CALLBACK;
           this->async_read(this->frame().mSyncCallbackId);
+          return;
+        case State::DELETE_CALLBACK:
+          this->frame().mState = State::ERROR;
+          this->template coinvoke<SendDelete, DeleteComplete>(
+            this->frame().mSyncCallbackId
+          );
           return;
         case State::SYNC_DONE:
           this->log_info("Sync requested: ", this->frame().mSyncCallbackId);
           this->sync(this->frame().mSyncCallbackId);
           this->coreturn();
           return;
+        case State::ERROR:
+          return;
         }
       }
     };
+
+    struct DeleteComplete {};
+    void coreturn(DeleteComplete) { mState = State::SYNC_DONE; }
   };
 
   class Dispatcher final : private coroutine::FrameMixin<Dispatcher> {

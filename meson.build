@@ -1,5 +1,5 @@
 project(
-  'ob-compositor', ['c', 'cpp']
+  'waypositor', ['c', 'cpp']
 , default_options : [
     'cpp_std=c++1z'
   , 'werror=true'
@@ -13,6 +13,7 @@ cpp_compiler = meson.get_compiler('cpp')
 maybe_cpp_flags = [
   '-fmax-errors=3'
 , '-ferror-limit=3'
+, '-fdiagnostics-show-template-tree'
 #, '-fvisibility=hidden'
 ]
 cpp_flags = []
@@ -31,7 +32,7 @@ boost = dependency('boost', modules : ['system'], required : true)
 threads = dependency('threads', required : false)
 
 executable(
-  'ob-compositor'
+  'waypositor'
 , 'src/compositor.cpp'
 , install : true
 , include_directories : include_directories('include')
