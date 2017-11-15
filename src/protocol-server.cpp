@@ -161,14 +161,14 @@ namespace waypositor {
         // coreturn is never called.) It also means the child frame is free to
         // call coreturn multiple times before it exits.
         template <typename ...Args>
-        void coreturn(Args&&... args) {
+        void coreturn(Args... args) {
           assert(*this);
           // Reach through the parent pointer to call coreturn. Usually this
           // means calling it on the frame data. The ReturnTag allows the parent
           // frame to invoke multiple coroutines with different coreturn
           // callbacks.
           this->frame().parent_pointer()->coreturn(
-            ReturnTag{}, std::forward<Args>(args)...
+            ReturnTag{}, std::move(args)...
           );
         }
 
