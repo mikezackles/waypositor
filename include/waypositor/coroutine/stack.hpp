@@ -32,6 +32,7 @@
 
 #include <boost/align/aligned_allocator.hpp>
 
+#include <memory>
 #include <vector>
 
 namespace waypositor { namespace coroutine {
