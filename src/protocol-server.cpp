@@ -261,59 +261,8 @@ namespace waypositor {
     void coreturn(HeaderReturn) { mState = State::DATA; }
   };
 
-  class Connection final {
-  private:
-    struct SyncReturnTag {};
+  class Connection {
   public:
-    class Sync final {
-    private:
-      class Impl {
-      private:
-        std::atomic<uint32_t> mCallbackId{1};
-        Connection &mConnection;
-
-      public:
-        Connection &get() { return mConnection; }
-        Connection const &get() const { return mConnection; }
-        void set_callback(uint32_t callback_id) { mCallbackId = callback_id; }
-
-        Impl(Connection &connection) : mConnection{connection} {}
-        ~Impl() {
-          // This is owned by a std::shared_ptr: there can no longer be concurrent
-          // access
-          uint32_t callback_id = mCallbackId;
-          // 1 is the id of the display singleton, so we know it cannot be used
-          // for a callback id. This ensures that we don't attempt to emit an
-          // event on shutdown if none was requested.
-          if (callback_id == 1) return;
-          mConnection.log_info("SYNC: ", callback_id);
-
-          // Emit sync event
-          coroutine::Stack::spawn<SendSync>(mConnection, callback_id);
-        }
-      };
-      std::shared_ptr<Impl> mImpl;
-
-      friend class Connection;
-      void set_callback(uint32_t callback_id) {
-        mImpl->set_callback(callback_id);
-      }
-    public:
-      Sync(Connection &connection)
-        : mImpl{std::make_shared<Impl>(connection)}
-      {}
-      Connection *operator->() { return &mImpl->get(); }
-      Connection const *operator->() const { return &mImpl->get(); }
-      Connection &operator*() { return mImpl->get(); }
-      Connection const &operator*() const { return mImpl->get(); }
-    };
-
-    class Dispatchable {
-    public:
-      virtual void dispatch(Sync sync, uint16_t opcode) = 0;
-      virtual ~Dispatchable() = default;
-    };
-
     Connection(
       std::size_t id, Logger &log, asio::io_service &asio
     , Domain::socket socket
@@ -321,9 +270,6 @@ namespace waypositor {
       , mSocket{std::move(socket)}
     { this->log_info("Accepted"); }
     ~Connection() {
-      // Hack to avoid honoring an outstanding sync if the entire connection is
-      // coming down
-      mSync.set_callback(1);
       this->log_info("Destroyed");
     }
 
@@ -362,6 +308,87 @@ namespace waypositor {
       auto lock = std::lock_guard(mSocketMutex);
       mSocket = std::nullopt;
     }
+  private:
+    std::size_t mId;
+    Logger &mLog;
+    asio::io_service &mAsio;
+    std::optional<Domain::socket> mSocket;
+    std::mutex mSocketMutex{};
+  };
+
+  class WaylandConnection final : public Connection {
+  private:
+    struct SyncReturnTag {};
+  public:
+    WaylandConnection(
+      std::size_t id, Logger &log, asio::io_service &asio
+    , Domain::socket socket
+    ) : Connection(id, log, asio, std::move(socket))
+    {}
+    ~WaylandConnection() {
+      // Hack to avoid honoring an outstanding sync if the entire connection is
+      // coming down
+      mSync.set_callback(1);
+    }
+
+    class Sync final {
+    private:
+      class Impl {
+      private:
+        std::atomic<uint32_t> mCallbackId{1};
+        WaylandConnection &mConnection;
+
+      public:
+        WaylandConnection &get() { return mConnection; }
+        WaylandConnection const &get() const { return mConnection; }
+        void set_callback(uint32_t callback_id) { mCallbackId = callback_id; }
+
+        Impl(WaylandConnection &connection) : mConnection{connection} {}
+        ~Impl() {
+          // This is owned by a std::shared_ptr: there can no longer be
+          // concurrent access
+          uint32_t callback_id = mCallbackId;
+          // 1 is the id of the display singleton, so we know it cannot be used
+          // for a callback id. This ensures that we don't attempt to emit an
+          // event on shutdown if none was requested.
+          if (callback_id == 1) return;
+          mConnection.log_info("SYNC: ", callback_id);
+
+          // Emit sync event
+          coroutine::Stack::spawn<SendSync>(mConnection, callback_id);
+        }
+      };
+      std::shared_ptr<Impl> mImpl;
+
+      friend class WaylandConnection;
+      void set_callback(uint32_t callback_id) {
+        mImpl->set_callback(callback_id);
+      }
+    public:
+      Sync(WaylandConnection &connection)
+        : mImpl{std::make_shared<Impl>(connection)}
+      {}
+      WaylandConnection *operator->() { return &mImpl->get(); }
+      WaylandConnection const *operator->() const { return &mImpl->get(); }
+      WaylandConnection &operator*() { return mImpl->get(); }
+      WaylandConnection const &operator*() const { return mImpl->get(); }
+    };
+
+    class Dispatchable {
+    public:
+      virtual void dispatch(Sync sync, uint16_t opcode) = 0;
+      virtual ~Dispatchable() = default;
+    };
+
+    void sync(uint32_t callback_id) {
+      // Destroy the previous Sync instance and replace it with a new one. Every
+      // dispatch has shared ownership of a Sync instance via a shared_ptr.
+      // Destroying the Connection's Sync pointer means that the moment all
+      // outstanding dispatches complete, a sync event will be emitted.
+      mSync = Sync(*this);
+      // Signal which callback id to use for emitting a sync event.
+      mSync.set_callback(callback_id);
+    }
 
     template <typename T, typename ...Args>
     void create(uint32_t id, Args&&... args) {
@@ -374,26 +401,6 @@ namespace waypositor {
     void destroy(uint32_t id) {
       auto lock = std::lock_guard(mDispatchablesMutex);
       mDispatchables.erase(id);
-    }
-
-    template <typename T, typename ...Args>
-    void spawn(Args&&... args) {
-      auto copy = mSync;
-      coroutine::Stack::spawn<T, SyncReturnTag>(
-        *this, std::move(copy), std::forward<Args>(args)...
-      );
-    }
-
-    void coreturn(SyncReturnTag) { /* Do nothing */ }
-
-    void sync(uint32_t callback_id) {
-      // Destroy the previous Sync instance and replace it with a new one. Every
-      // dispatch has shared ownership of a Sync instance via a shared_ptr.
-      // Destroying the Connection's Sync pointer means that the moment all
-      // outstanding dispatches complete, a sync event will be emitted.
-      mSync = Sync(*this);
-      // Signal which callback id to use for emitting a sync event.
-      mSync.set_callback(callback_id);
     }
 
     void dispatch(uint32_t object_id, uint16_t opcode) {
@@ -410,10 +417,10 @@ namespace waypositor {
 
     class WriteLock {
     private:
-      Connection *mConnection;
+      WaylandConnection *mConnection;
       struct Private {};
     public:
-      WriteLock(Connection &connection)
+      WriteLock(WaylandConnection &connection)
         : mConnection{&connection} {}
       WriteLock(WriteLock &&other) : mConnection{other.mConnection}
       { other.mConnection = nullptr; }
@@ -427,7 +434,7 @@ namespace waypositor {
         if (mConnection != nullptr) mConnection->mWriteLock = false;
       }
 
-      static std::optional<WriteLock> create(Connection &connection) {
+      static std::optional<WriteLock> create(WaylandConnection &connection) {
         bool expected = false;
         auto lock = connection.mWriteLock.compare_exchange_weak(expected, true);
         if (lock) {
@@ -440,12 +447,17 @@ namespace waypositor {
 
     auto write_lock_guard() { return WriteLock::create(*this); }
 
+    void coreturn(SyncReturnTag) { /* Do nothing */ }
+
+    template <typename T, typename ...Args>
+    void spawn(Args&&... args) {
+      auto copy = mSync;
+      coroutine::Stack::spawn<T, SyncReturnTag>(
+        *this, std::move(copy), std::forward<Args>(args)...
+      );
+    }
+
   private:
-    std::size_t mId;
-    Logger &mLog;
-    asio::io_service &mAsio;
-    std::optional<Domain::socket> mSocket;
-    std::mutex mSocketMutex{};
     std::unordered_map<
       uint32_t, std::unique_ptr<Dispatchable>
     > mDispatchables{};
@@ -460,7 +472,7 @@ namespace waypositor {
     enum class State { WAITING, HEADER, SEND, DONE, ERROR };
     State mState{State::HEADER};
     uint32_t mDeletedId;
-    std::optional<Connection::WriteLock> mWriteLock;
+    std::optional<WaylandConnection::WriteLock> mWriteLock;
 
     static constexpr uint32_t object_id = 1; // singleton
     static constexpr uint16_t opcode = 1;
@@ -577,7 +589,7 @@ namespace waypositor {
     uint32_t mInterfaceId;
     std::string_view mInterfaceName;
     uint32_t mVersion;
-    std::optional<Connection::WriteLock> mWriteLock;
+    std::optional<WaylandConnection::WriteLock> mWriteLock;
 
     static constexpr uint16_t opcode = 0;
 
@@ -689,10 +701,10 @@ namespace waypositor {
     };
   };
 
-  class Registry final : public Connection::Dispatchable {
+  class Registry final : public WaylandConnection::Dispatchable {
   public:
     void dispatch(
-      Connection::Sync sync, uint16_t opcode
+      WaylandConnection::Sync sync, uint16_t opcode
     ) override {
       sync->log_info("Registry request: ", opcode);
     }
@@ -862,7 +874,7 @@ namespace waypositor {
     asio::io_service &mAsio;
     Domain::acceptor mAcceptor;
     Domain::socket mSocket;
-    std::optional<coroutine::Forker<Connection>> mConnections;
+    std::optional<coroutine::Forker<WaylandConnection>> mConnections;
     State mState;
 
     class Worker final {
@@ -939,7 +951,7 @@ namespace waypositor {
     , Logger &log, asio::io_service &asio, filesystem::path const &path
     ) : mLog{log}, mAsio{asio}
       , mAcceptor{asio, path.native()}, mSocket{asio}
-      , mConnections{std::make_optional<coroutine::Forker<Connection>>()}
+      , mConnections{std::make_optional<coroutine::Forker<WaylandConnection>>()}
       , mState{State::LISTENING}
     {}
 
