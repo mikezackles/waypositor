@@ -28,6 +28,7 @@
 // EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <waypositor/coroutine/forker.hpp>
+#include <waypositor/coroutine/mixins.hpp>
 #include <waypositor/coroutine/stack.hpp>
 #include <waypositor/logger.hpp>
 
@@ -40,7 +41,6 @@
 #include <unordered_map>
 #include <experimental/filesystem>
 
-#include <boost/asio/buffer.hpp>
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/local/stream_protocol.hpp>
 #include <boost/asio/read.hpp>
@@ -52,105 +52,6 @@ namespace waypositor {
   namespace asio = boost::asio;
   using Domain = asio::local::stream_protocol;
   using namespace std::literals;
-
-  namespace coroutine {
-    // Factor out some boilerplate
-    template <typename State, typename StackPointer>
-    class LogicMixin {
-    private:
-      using Logic = typename State::template Logic<StackPointer>;
-      StackPointer mSelf;
-    public:
-      LogicMixin(StackPointer self) : mSelf{std::move(self)} {}
-
-      // ASIO error-handling boilerplate
-      void operator()(
-        boost::system::error_code const &error = {}, std::size_t = 0
-      ) {
-        if (error) {
-          mSelf.context().log_error("ASIO error: ", error.message());
-          return;
-        }
-
-        // Resume the actual logic
-        static_cast<Logic *>(this)->resume();
-      }
-
-    protected:
-      auto &context() { return mSelf.context(); }
-
-      template <typename Destination>
-      void async_read(Destination &destination) {
-        mSelf.context().async_read(
-          asio::buffer(&destination, sizeof(Destination))
-        , std::move(static_cast<Logic &>(*this))
-        );
-      }
-
-      template <typename Source>
-      void async_write(Source &source) {
-        static_assert(std::is_integral_v<Source>);
-        mSelf.context().async_write(
-          asio::buffer(&source, sizeof(Source))
-        , std::move(static_cast<Logic &>(*this))
-        );
-      }
-
-      void async_write(std::string_view source) {
-        mSelf.context().async_write(
-          asio::buffer(source.data(), source.size() + 1)
-        , std::move(static_cast<Logic &>(*this))
-        );
-      }
-
-      template <typename ...Args>
-      void log_info(Args&&... args) {
-        mSelf.context().log_info(std::forward<Args>(args)...);
-      }
-
-      template <typename ...Args>
-      void log_error(Args&&... args) {
-        mSelf.context().log_error(std::forward<Args>(args)...);
-      }
-
-      void suspend() {
-        mSelf.context().post(std::move(static_cast<Logic &>(*this)));
-      }
-
-      // Invoke a new coroutine
-      template <
-        // The frame data for the coroutine. This type should define a type
-        // U::Logic<FramePointer> that accepts ownership of the FramePointer
-        // created by this function in its constructor. It should also define
-        // a member function U::coreturn(ReturnTag, ...)
-        typename U
-      , // The tag the child logic should use when invoking coreturn on the
-        // frame data
-        typename ReturnTag
-      , // Arguments for constructing the frame data
-        typename ...Args
-      >
-      void coinvoke(Args&&... args) {
-        mSelf.template coinvoke<U, ReturnTag, Logic>(
-          std::forward<Args>(args)...
-        );
-      }
-
-      template <typename ...Args>
-      void coreturn(Args&&... args) {
-        mSelf.coreturn(std::forward<Args>(args)...);
-      }
-
-      State &frame() { return *mSelf; }
-      State const &frame() const { return *mSelf; }
-    };
-
-    template <typename Derived>
-    struct FrameMixin {
-      template <typename StackPointer>
-      using LogicMixin = LogicMixin<Derived, StackPointer>;
-    };
-  }
 
   template <typename State, typename StackPointer>
   class LogicMixin : public coroutine::LogicMixin<State, StackPointer> {
