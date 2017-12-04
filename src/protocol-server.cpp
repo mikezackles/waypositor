@@ -1,4 +1,4 @@
-// Copyright (c) 2017, Oblong Industries, Inc.
+
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -27,6 +27,7 @@
 // OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
 // EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include <waypositor/coroutine/connection.hpp>
 #include <waypositor/coroutine/forker.hpp>
 #include <waypositor/coroutine/mixins.hpp>
 #include <waypositor/coroutine/stack.hpp>
@@ -180,64 +181,10 @@ namespace waypositor {
     void coreturn(HeaderReturn) { mState = State::DATA; }
   };
 
-  class Connection {
-  public:
-    Connection(
-      std::size_t id, Logger &log, asio::io_service &asio
-    , Domain::socket socket
-    ) : mId{id}, mLog{log}, mAsio{asio}
-      , mSocket{std::move(socket)}
-    { this->log_info("Accepted"); }
-    ~Connection() {
-      this->log_info("Destroyed");
-    }
-
-    template <typename Callback>
-    void post(Callback &&callback) {
-      mAsio.post(std::move(callback));
-    }
-
-    template <typename Buffers, typename Continuation>
-    void async_read(Buffers &&buffers, Continuation continuation) {
-      auto lock = std::lock_guard(mSocketMutex);
-      asio::async_read(
-        *mSocket, buffers, std::move(continuation)
-      );
-    }
-
-    template <typename Buffers, typename Continuation>
-    void async_write(Buffers &&buffers, Continuation continuation) {
-      auto lock = std::lock_guard(mSocketMutex);
-      asio::async_write(
-        *mSocket, buffers, std::move(continuation)
-      );
-    }
-
-    template <typename ...Args>
-    void log_info(Args&&... args) {
-      mLog.info("(Connection ", mId, ") ", std::forward<Args>(args)...);
-    }
-
-    template <typename ...Args>
-    void log_error(Args&&... args) {
-      mLog.error("(Connection ", mId, ") ", std::forward<Args>(args)...);
-    }
-
-    void shutdown() {
-      auto lock = std::lock_guard(mSocketMutex);
-      mSocket = std::nullopt;
-    }
-  private:
-    std::size_t mId;
-    Logger &mLog;
-    asio::io_service &mAsio;
-    std::optional<Domain::socket> mSocket;
-    std::mutex mSocketMutex{};
-  };
-
-  class WaylandConnection final : public Connection {
+  class WaylandConnection final : public coroutine::Connection<Domain::socket> {
   private:
     struct SyncReturnTag {};
+    struct Private {};
   public:
     WaylandConnection(
       std::size_t id, Logger &log, asio::io_service &asio
@@ -337,9 +284,8 @@ namespace waypositor {
     class WriteLock {
     private:
       WaylandConnection *mConnection;
-      struct Private {};
     public:
-      WriteLock(WaylandConnection &connection)
+      WriteLock(Private, WaylandConnection &connection)
         : mConnection{&connection} {}
       WriteLock(WriteLock &&other) : mConnection{other.mConnection}
       { other.mConnection = nullptr; }
@@ -357,7 +303,7 @@ namespace waypositor {
         bool expected = false;
         auto lock = connection.mWriteLock.compare_exchange_weak(expected, true);
         if (lock) {
-          return std::make_optional<WriteLock>(connection);
+          return std::make_optional<WriteLock>(Private{}, connection);
         } else {
           return std::nullopt;
         }
