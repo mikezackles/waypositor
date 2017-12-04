@@ -77,6 +77,8 @@ namespace waypositor {
       }
 
     protected:
+      auto &context() { return mSelf.context(); }
+
       template <typename Destination>
       void async_read(Destination &destination) {
         mSelf.context().async_read(
@@ -139,26 +141,6 @@ namespace waypositor {
         mSelf.coreturn(std::forward<Args>(args)...);
       }
 
-      void dispatch(uint32_t object_id, uint16_t opcode) {
-        mSelf.context().dispatch(object_id, opcode);
-      }
-
-      template <typename T, typename ...Args>
-      void create(Args&&... args) {
-        mSelf.context().template create<T>(std::forward<Args>(args)...);
-      }
-
-      template <typename T, typename ...Args>
-      void spawn(Args&&... args) {
-        mSelf.context().template spawn<T>(std::forward<Args>(args)...);
-      }
-
-      uint32_t next_serial() { return mSelf.context().next_serial(); }
-
-      void sync(uint32_t callback_id) { mSelf.context().sync(callback_id); }
-
-      auto write_lock_guard() { return mSelf.context().write_lock_guard(); }
-
       State &frame() { return *mSelf; }
       State const &frame() const { return *mSelf; }
     };
@@ -170,7 +152,43 @@ namespace waypositor {
     };
   }
 
-  class SendHeader final : public coroutine::FrameMixin<SendHeader> {
+  template <typename State, typename StackPointer>
+  class LogicMixin : public coroutine::LogicMixin<State, StackPointer> {
+  private:
+    using coroutine::LogicMixin<State, StackPointer>::context;
+  public:
+    LogicMixin(StackPointer self)
+      : coroutine::LogicMixin<State, StackPointer>(std::move(self))
+    {}
+
+    void dispatch(uint32_t object_id, uint16_t opcode) {
+      this->context().dispatch(object_id, opcode);
+    }
+
+    template <typename T, typename ...Args>
+    void create(Args&&... args) {
+      this->context().template create<T>(std::forward<Args>(args)...);
+    }
+
+    template <typename T, typename ...Args>
+    void spawn(Args&&... args) {
+      this->context().template spawn<T>(std::forward<Args>(args)...);
+    }
+
+    uint32_t next_serial() { return this->context().next_serial(); }
+
+    void sync(uint32_t callback_id) { this->context().sync(callback_id); }
+
+    auto write_lock_guard() { return this->context().write_lock_guard(); }
+  };
+
+  template <typename Derived>
+  struct FrameMixin {
+    template <typename StackPointer>
+    using LogicMixin = LogicMixin<Derived, StackPointer>;
+  };
+
+  class SendHeader final : public FrameMixin<SendHeader> {
   private:
     enum class State { OBJECT_ID, OPCODE, MESSAGE_SIZE, FINISHED };
     State mState{State::OBJECT_ID};
@@ -220,7 +238,7 @@ namespace waypositor {
     };
   };
 
-  class SendSync final : public coroutine::FrameMixin<SendSync> {
+  class SendSync final : public FrameMixin<SendSync> {
   private:
     enum class State { HEADER, DATA, FINISHED, ERROR };
     State mState{State::HEADER};
@@ -467,7 +485,7 @@ namespace waypositor {
     std::atomic<bool> mWriteLock{false};
   };
 
-  class SendDelete final : public coroutine::FrameMixin<SendDelete> {
+  class SendDelete final : public FrameMixin<SendDelete> {
   private:
     enum class State { WAITING, HEADER, SEND, DONE, ERROR };
     State mState{State::HEADER};
@@ -516,7 +534,7 @@ namespace waypositor {
     void coreturn(HeaderResult) { mState = State::SEND; }
   };
 
-  class SendString final : public coroutine::FrameMixin<SendString> {
+  class SendString final : public FrameMixin<SendString> {
   //private:
   public:
     enum class State { LENGTH, MESSAGE, PADDING, FINISHED };
@@ -580,8 +598,7 @@ namespace waypositor {
     };
   };
 
-  class AnnounceInterface final
-    : public coroutine::FrameMixin<AnnounceInterface> {
+  class AnnounceInterface final : public FrameMixin<AnnounceInterface> {
   private:
     enum class State { WAITING, HEADER, ID, NAME, VERSION, FINISHED, ERROR };
     State mState{State::HEADER};
@@ -664,7 +681,7 @@ namespace waypositor {
 
   // It might be more efficient to read this in one fell swoop instead of one
   // field at a time, but for now this both readable and portable.
-  class HeaderParser final : private coroutine::FrameMixin<HeaderParser> {
+  class HeaderParser final : private FrameMixin<HeaderParser> {
   private:
     enum class State { OBJECT_ID, OPCODE, MESSAGE_SIZE, FINISHED };
     State mState{State::OBJECT_ID};
@@ -710,8 +727,7 @@ namespace waypositor {
     }
   };
 
-  class GetRegistryRequest final
-    : private coroutine::FrameMixin<GetRegistryRequest> {
+  class GetRegistryRequest final : private FrameMixin<GetRegistryRequest> {
   private:
     enum class State { ID, CREATE, COMPOSITOR, FINISHED, ERROR };
     State mState{State::ID};
@@ -751,7 +767,7 @@ namespace waypositor {
     void coreturn(AnnounceResult) { mState = State::FINISHED; }
   };
 
-  class DisplayDispatch final : private coroutine::FrameMixin<DisplayDispatch> {
+  class DisplayDispatch final : private FrameMixin<DisplayDispatch> {
   private:
     enum class State {
       DISPATCH, PARSE_SYNC, DELETE_CALLBACK, SYNC_DONE, ERROR
@@ -813,7 +829,7 @@ namespace waypositor {
     void coreturn(DeleteComplete) { mState = State::SYNC_DONE; }
   };
 
-  class Dispatcher final : private coroutine::FrameMixin<Dispatcher> {
+  class Dispatcher final : private FrameMixin<Dispatcher> {
   private:
     struct DispatchResult {};
     struct HeaderResult {};
